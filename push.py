@@ -1,6 +1,8 @@
 import os
+import random
 import re
 import shutil
+import string
 import subprocess
 import sys
 from pathlib import Path
@@ -10,10 +12,18 @@ HERE = Path(__file__).resolve().parent
 # Change this if your member bot repository is somewhere else. It can also be
 # passed as the first argument, or set as the WISP_REMOTE environment variable.
 DEFAULT_REMOTE = "https://github.com/Iwqndr/wispcordbot.git"
-DEFAULT_MESSAGE = "new update"
 
 # Wispbyte is configured to deploy the `main` branch.
 BRANCH = "main"
+
+# Commit message alphabet and length for the random message generated per run.
+MESSAGE_ALPHABET = string.ascii_lowercase + string.digits
+MESSAGE_LENGTH = 8
+
+
+def random_message() -> str:
+    """A fresh 8-character [a-z0-9] commit message."""
+    return "".join(random.choice(MESSAGE_ALPHABET) for _ in range(MESSAGE_LENGTH))
 
 
 def run(*args, check=False):
@@ -60,9 +70,9 @@ def git_available() -> bool:
 
 
 def parse_args(argv):
-    """`[remote-url]`, `-m <message>`, `--force`, `-h`."""
+    """`[remote-url]`, `-m <message>`, `-f`, `-h`."""
     url = None
-    message = DEFAULT_MESSAGE
+    message = None  # None means: generate a random one
     force = False
     index = 0
     while index < len(argv):
@@ -125,7 +135,6 @@ def current_branch() -> str:
     """The branch we are on, or '' if detached / no commits yet."""
     result = run("rev-parse", "--abbrev-ref", "HEAD")
     name = result.stdout.strip()
-    # "HEAD" means detached. Empty means no commits yet.
     if not name or name == "HEAD":
         return ""
     return name
@@ -146,45 +155,42 @@ def rebase_in_progress() -> bool:
     return (gd / "rebase-merge").exists() or (gd / "rebase-apply").exists()
 
 
-def clear_stuck_rebase() -> None:
-    """Abort or clear any rebase left over from a previous run.
+def clear_stuck_git_state() -> None:
+    """Clear any leftover rebase/merge/cherry-pick state."""
+    changed = False
 
-    A leftover rebase-merge directory blocks every future `git pull --rebase`
-    and `git rebase`, so we clean it up before doing anything else.
-    """
-    if not rebase_in_progress():
-        return
-    info("A previous rebase is still in progress - aborting it.")
-    abort = run("rebase", "--abort")
-    if abort.returncode != 0:
-        # git refused (already resolved, or dir is stale). Remove the state
-        # directories directly so we can move on.
-        info("`git rebase --abort` did not clear it - removing rebase state.")
-        gd = git_dir()
-        for name in ("rebase-merge", "rebase-apply"):
-            target = gd / name
-            if target.exists():
-                try:
-                    shutil.rmtree(target)
-                except OSError as exc:
-                    fail(f"Could not remove {target}: {exc}")
-    # Clear stale MERGE_HEAD / CHERRY_PICK_HEAD etc. that block commits.
+    if rebase_in_progress():
+        info("A previous rebase is still in progress - aborting it.")
+        abort = run("rebase", "--abort")
+        if abort.returncode != 0:
+            info("`git rebase --abort` did not clear it - removing rebase state.")
+            gd = git_dir()
+            for name in ("rebase-merge", "rebase-apply"):
+                target = gd / name
+                if target.exists():
+                    try:
+                        shutil.rmtree(target)
+                    except OSError as exc:
+                        fail(f"Could not remove {target}: {exc}")
+        changed = True
+
     gd = git_dir()
     for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"):
         target = gd / name
         if target.exists():
             try:
                 target.unlink()
+                changed = True
             except OSError:
                 pass
-    ok("Cleared the stuck rebase state.")
+
+    if changed:
+        ok("Cleared leftover git state.")
 
 
 def ensure_on_branch() -> str:
     """Make sure we're on a real branch, creating/moving one if needed."""
     if not has_any_commit():
-        # Fresh repo, no commits yet. Point HEAD at the deploy branch so the
-        # first commit lands there.
         if current_branch() != BRANCH:
             info(f"No commits yet - pointing HEAD at '{BRANCH}'.")
             run("symbolic-ref", "HEAD", f"refs/heads/{BRANCH}")
@@ -194,7 +200,6 @@ def ensure_on_branch() -> str:
     if branch:
         return branch
 
-    # Detached HEAD with commits. Attach to the deploy branch.
     info(f"HEAD is detached - attaching to branch '{BRANCH}'.")
     move = run("checkout", "-B", BRANCH)
     if move.returncode != 0:
@@ -224,8 +229,6 @@ def ensure_repo(remote_url: str, force: bool) -> None:
 
     info("Not a git repository yet - setting one up.")
     if run("init", "-b", BRANCH).returncode != 0:
-        # Git older than 2.28 has no `-b`, so init then point HEAD at main
-        # before the first commit exists.
         run("init")
         run("symbolic-ref", "HEAD", f"refs/heads/{BRANCH}")
     ok(f"Initialised a repository on branch '{BRANCH}'.")
@@ -246,27 +249,21 @@ def ensure_identity() -> None:
     if not run("config", "user.email").stdout.strip():
         run("config", "user.email", email)
     info(f"Set this repository's commit identity to {owner} <{email}>.")
-    info("It is local to this repository; change it with `git config user.email ...`.")
 
 
-def has_unpushed_commits(branch: str) -> bool:
-    """True when local HEAD is ahead of origin/<branch>."""
-    # If the remote branch doesn't exist, any local commit is unpushed.
-    if run("ls-remote", "--exit-code", "--heads", "origin", branch).returncode != 0:
-        # No commits at all? Nothing to push.
-        if not has_any_commit():
-            return False
-        return True
-    # Count commits on HEAD not on origin/<branch>.
-    result = run("rev-list", "--count", f"origin/{branch}..HEAD")
-    try:
-        return int(result.stdout.strip() or "0") > 0
-    except ValueError:
-        return False
+def remote_has_branch(branch: str) -> bool:
+    """True when origin/<branch> already exists on the remote."""
+    return run("ls-remote", "--exit-code", "--heads", "origin", branch).returncode == 0
+
+
+def count_local_changes() -> int:
+    """How many files differ from HEAD (staged, unstaged, or untracked)."""
+    result = run("status", "--porcelain")
+    return len([ln for ln in result.stdout.splitlines() if ln.strip()])
 
 
 def main() -> None:
-    remote_arg, message, force = parse_args(sys.argv[1:])
+    remote_arg, message_opt, force = parse_args(sys.argv[1:])
 
     if not git_available():
         fail("git was not found on PATH. Install Git for Windows, then reopen "
@@ -276,76 +273,79 @@ def main() -> None:
 
     ensure_repo(remote_url, force)
     ensure_identity()
-
-    # A leftover rebase from a previous run blocks every future rebase, so
-    # clear it before we touch anything else.
-    clear_stuck_rebase()
+    clear_stuck_git_state()
 
     branch = ensure_on_branch()
 
-    status = run("status", "--porcelain").stdout.strip()
+    info("Fetching origin...")
+    fetch = run("fetch", "origin")
+    if fetch.returncode != 0:
+        fail("git fetch failed:\n"
+             f"{(fetch.stderr or fetch.stdout).strip()}")
 
-    if status:
+    has_remote = remote_has_branch(branch)
+    if not has_remote:
+        info(f"origin/{branch} does not exist yet - this push will create it.")
+
+    dirty = count_local_changes() > 0
+
+    # If local is behind the remote but the tree is clean, fast-forward so we
+    # don't accidentally try to push a stale branch.
+    if has_remote and not dirty and has_any_commit():
+        head = run("rev-parse", "HEAD").stdout.strip()
+        origin_head = run("rev-parse", f"origin/{branch}").stdout.strip()
+        if head != origin_head:
+            # Try a fast-forward-only pull. If it can't (diverged), just leave
+            # it; the rebase below will handle it.
+            run("merge", "--ff-only", f"origin/{branch}")
+
+    # Commit whatever changed locally. This is the normal path: no reset, no
+    # squash, real history preserved.
+    if dirty:
         info("Changes to push:")
-        for line in status.splitlines():
+        for line in run("status", "--porcelain").stdout.splitlines():
             print(f"     {line}")
 
         info("Staging...")
-        add = run("add", ".")
+        add = run("add", "-A")
         if add.returncode != 0:
             fail(f"git add failed:\n{(add.stderr or add.stdout).strip()}")
 
-        # Only commit when staging actually produced something.
         if run("diff", "--cached", "--quiet").returncode != 0:
+            message = message_opt if message_opt is not None else random_message()
             info(f"Committing as: {message!r}")
             commit = run("commit", "-m", message)
             if commit.returncode != 0:
-                fail(f"git commit failed:\n{(commit.stderr or commit.stdout).strip()}\n\n"
-                     "If it complained about who you are, set your identity once:\n"
-                     "    git config user.name \"Your Name\"\n"
-                     "    git config user.email \"you@example.com\"")
+                fail(f"git commit failed:\n{(commit.stderr or commit.stdout).strip()}")
         else:
             info("Nothing staged to commit (everything may be ignored).")
     else:
         info("Working tree is clean.")
 
-    # Re-read the branch: committing may have been what first created it.
-    branch = current_branch() or branch
+    # Are we ahead of the remote, or identical? If identical, done.
+    if has_remote and has_any_commit():
+        head = run("rev-parse", "HEAD").stdout.strip()
+        origin_head = run("rev-parse", f"origin/{branch}").stdout.strip()
+        if head == origin_head:
+            ok("Nothing to push. Working tree is clean and remote is up to date.")
+            return
 
-    # Check for unpushed commits, not just a dirty tree.
-    if not has_unpushed_commits(branch):
-        ok("Nothing to push. Working tree is clean and remote is up to date.")
-        return
-
-    if branch != BRANCH:
-        info(f"Note: you are on '{branch}', but Wispbyte is configured for the "
-             f"'{BRANCH}' branch. Run `git branch -M {BRANCH}` if that is not "
-             f"intended.")
-
-    # Pull only when the remote actually has this branch.
-    if run("ls-remote", "--exit-code", "--heads", "origin", branch).returncode == 0:
-        info(f"Rebasing onto origin/{branch}...")
-        pull = run("pull", "--rebase", "origin", branch)
+    # If the remote moved while we were away, rebase our commits on top of it.
+    # -X ours means: for conflicting hunks, keep our side. This is what stops
+    # the "rebase conflict" hanging state you hit before.
+    if has_remote:
+        info(f"Rebasing onto origin/{branch} (-X ours)...")
+        pull = run("pull", "--rebase", "-X", "ours", "origin", branch)
         if pull.returncode != 0:
-            # The most common failure here is a conflict. Don't leave the
-            # rebase half-done: tell the user, then abort so the next run is
-            # clean. The user's local commit is preserved either way.
+            # Something unexpected - abort the rebase so the next run is clean.
             print((pull.stderr or pull.stdout).strip())
             if rebase_in_progress():
-                info("Conflicts detected - aborting the rebase so the next run "
-                     "starts clean. Your local commit is preserved.")
+                info("Rebase could not complete - aborting so the next run is clean.")
                 run("rebase", "--abort")
-                fail("git pull --rebase hit conflicts. Your commit is safe on "
-                     "'{0}'. Pull manually with `git pull --rebase origin {0}`, "
-                     "resolve conflicts, then re-run push.py.".format(branch))
-            fail("git pull failed. Your commit is saved locally; retry when "
-                 "ready.")
-    else:
-        info(f"origin/{branch} does not exist yet - this push will create it.")
+            fail("git pull --rebase failed. Your commit is safe locally; retry "
+                 "when ready.")
 
     info("Pushing to origin...")
-    # Push the branch by name, not HEAD: if HEAD is detached for any reason,
-    # `git push origin HEAD` fails with "not a full refname".
     push = run("push", "-u", "origin", branch)
     if push.returncode != 0:
         fail("git push failed. Your commit is saved locally; retry when ready:\n"

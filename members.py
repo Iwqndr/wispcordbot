@@ -35,7 +35,10 @@ BOT_VERSION = "1.0.0"
 
 # Where every JSON file of persistent state lives. Created on first run and
 # deliberately gitignored — this is runtime data, not source.
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memberbot_data")
+DATA_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "logging", "memberbot_data",
+)
 
 # The URL the "support page" link in the ticket panel points at. The member
 # page checks `?open=support` on load and opens the support modal itself.
@@ -114,6 +117,10 @@ COMMAND_USES = collections.Counter()
 WORK_COOLDOWN_UNTIL = {}
 MARRIAGE_REWARDED = set()
 LAST_PASSIVE_PAYOUT = {}
+
+# uid -> checksum of the last economy row pushed to Supabase, so an unchanged
+# member is not re-sent on every sweep.
+_ECONOMY_DIRTY = {}
 
 LUCKY_CHANCE = 0.05
 QWORK_SECONDS = 120
@@ -2962,9 +2969,9 @@ async def before_reminder_sweep():
 
 @tasks.loop(seconds=60)
 async def heartbeat():
-    """Upsert the `member` row in `bot_status` once a minute.
+    """Upsert the `member` row in `bot_status`, then mirror the economy.
 
-    The member page reads this row with the anon key (RLS allows SELECT), and
+    The member site reads both with the anon key (RLS allows SELECT) and
     considers the bot online while the timestamp is under three minutes old.
     Any failure is logged once and then ignored — a heartbeat must never take
     the process down.
@@ -2976,9 +2983,78 @@ async def heartbeat():
         "guild_count": len(bot.guilds),
         "member_count": sum(g.member_count or 0 for g in bot.guilds),
         "latency_ms": latency_ms(),
+        "uptime_seconds": int(time.time() - START_TIME),
     }
     if not supa_upsert("bot_status", row, "id"):
         log("Heartbeat failed — check SUPABASE_URL / SUPABASE_SERVICE_KEY and the bot_status table.")
+
+    mirror_economy()
+
+
+def mirror_economy(force: bool = False) -> None:
+    """Push economy records to the `economy` table, but only what changed.
+
+    The JSON file stays the source of truth; this is a read-only mirror so the
+    member site can show balances and levels. A failure is logged and skipped,
+    because the bot has to keep running even when the site cannot be reached.
+
+    Rows are checksummed and skipped when unchanged, so a quiet server costs one
+    small request per pass instead of one row per member every time.
+    """
+    global _ECONOMY_DIRTY
+
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    rows = []
+    seen = set()
+
+    for uid, rec in list(economy.data.items()):
+        if not isinstance(rec, dict) or not str(uid).isdigit():
+            continue
+        key = str(uid)
+        seen.add(key)
+        row = {
+            "user_id": key,
+            "balance": int(rec.get("balance", 0)),
+            "bank": int(rec.get("bank", 0)),
+            "xp": int(rec.get("xp", 0)),
+            "level": level_of(rec),
+            "wins": int(rec.get("wins", 0)),
+            "losses": int(rec.get("losses", 0)),
+            "streak": int(rec.get("streak", 0)),
+            "updated_at": now,
+        }
+        digest = hashlib.sha256(
+            f"{row['balance']}|{row['bank']}|{row['xp']}|{row['level']}|"
+            f"{row['wins']}|{row['losses']}|{row['streak']}".encode("utf-8")
+        ).hexdigest()
+        if not force and _ECONOMY_DIRTY.get(key) == digest:
+            continue
+        _ECONOMY_DIRTY[key] = digest
+        rows.append(row)
+
+    # Forget records for people who no longer have an entry, so the cache cannot
+    # grow forever.
+    for gone in [k for k in _ECONOMY_DIRTY if k not in seen]:
+        _ECONOMY_DIRTY.pop(gone, None)
+
+    if not rows:
+        return
+
+    # Batched, so one enormous guild cannot build a single oversized request.
+    for start in range(0, len(rows), 200):
+        chunk = rows[start:start + 200]
+        status, raw = supa(
+            "POST",
+            "economy?on_conflict=user_id",
+            data=chunk,
+            extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        if not (200 <= status < 300):
+            log(f"Economy mirror failed ({status}): {raw[:200]}")
+            return
 
 
 @heartbeat.before_loop
