@@ -3040,28 +3040,33 @@ async def heartbeat():
         "uptime_seconds": int(time.time() - START_TIME),
     }
     if not supa_upsert("bot_status", row, "id"):
-        # Report the actual cause. A bare "heartbeat failed" sends you hunting
-        # when in practice it is one of three things: the key is missing, the
-        # key is wrong, or the table is missing.
-        detail = _supabase_diagnosis()
-        log(f"Heartbeat failed — {detail}")
+        # `uptime_seconds` only exists if the schema has been migrated. Rather
+        # than let the whole heartbeat fail on a missing optional column, drop
+        # it and try the write that has always worked.
+        row.pop("uptime_seconds", None)
+        if supa_upsert("bot_status", row, "id"):
+            log("Heartbeat saved without uptime — add the column to bot_status "
+                "(alter table bot_status add column if not exists uptime_seconds integer default 0;) "
+                "to get real uptime on the site.")
+        else:
+            log(f"Heartbeat failed — {_supabase_diagnosis()}")
 
     mirror_economy()
 
 
 def _supabase_diagnosis() -> str:
-    """A short, specific reason the last Supabase write did not land."""
+    """A short, specific reason the last Supabase write did not land.
+
+    The body is trimmed to a line and the status code is always included: with
+    the raw body alone, a successful read and a rejected write can look alike.
+    """
     if not SUPABASE_URL:
         return "SUPABASE_URL is not set."
     if not SUPABASE_SERVICE_KEY:
         return "SUPABASE_SERVICE_KEY is not set."
 
-    status, raw = supa(
-        "GET",
-        "bot_status?select=id&limit=1",
-        extra_headers={"Prefer": "return=minimal"},
-    )
-    body = (raw or "").strip().replace("\n", " ")[:200]
+    status, raw = supa("GET", "bot_status?select=id&limit=1")
+    body = (raw or "").strip().replace("\n", " ")[:300]
 
     if status == 0:
         return f"the request never completed ({body or 'network error'})."
@@ -3074,7 +3079,11 @@ def _supabase_diagnosis() -> str:
                 f"wispbyte_schema.sql in the Supabase SQL editor. {body}")
     if status >= 400:
         return f"HTTP {status}. {body}"
-    return f"unexpected response (HTTP {status}). {body}"
+    # A readable table means the read works, so the failure is in the write —
+    # almost always a column that has not been added yet.
+    return (f"the write was rejected while reads still work (probe HTTP {status}), which usually "
+            f"means a column is missing from bot_status. Run the ALTER TABLE statements from "
+            f"pages/schema.sql. Read probe: {body}")
 
 
 def mirror_economy(force: bool = False) -> None:
