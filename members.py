@@ -8,6 +8,7 @@ import math
 import os
 import random
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -33,12 +34,50 @@ SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
 # Bumped by hand when the deployed build changes; lands in the heartbeat row.
 BOT_VERSION = "1.0.0"
 
+def _pick_data_dir() -> str:
+    """Where to keep the JSON state files, chosen to survive any host.
+
+    This file lives in `referenced/wispcord/` in the repo, but on a host like
+    Wispbyte it is often copied to `/home/container/` on its own — so climbing
+    `../../..` produced `/logging`, which is not writable and killed the process
+    at import time. Candidates are tried in order and the first writable one
+    wins, so the same file works from the repo, from a bare container, and with
+    an explicit override.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(os.path.dirname(here))
+
+    candidates = []
+    override = (os.getenv("MEMBERBOT_DATA_DIR") or "").strip()
+    if override:
+        candidates.append(override)
+    candidates.append(os.path.join(repo_root, "logging", "memberbot_data"))
+    candidates.append(os.path.join(here, "memberbot_data"))
+    candidates.append("/home/container/logging/memberbot_data")
+    candidates.append("/home/container/memberbot_data")
+
+    for path in candidates:
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".write-test")
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("ok")
+            os.remove(probe)
+            return path
+        except Exception:
+            continue
+
+    # Nothing is writable: fall back to the temp dir so the bot still boots.
+    # State will not survive a restart, but a crash here would take the whole
+    # process down before it ever logged in.
+    fallback = os.path.join(tempfile.gettempdir(), "wispcord_memberbot")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+
 # Where every JSON file of persistent state lives. Created on first run and
 # deliberately gitignored — this is runtime data, not source.
-DATA_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "logging", "memberbot_data",
-)
+DATA_DIR = _pick_data_dir()
 
 # The URL the "support page" link in the ticket panel points at. The member
 # page checks `?open=support` on load and opens the support modal itself.
