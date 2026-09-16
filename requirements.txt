@@ -1,0 +1,4 @@
+# Everything members.py actually imports. Nothing else is needed: HTTP is done
+# with the standard library's urllib, and all persistence is plain JSON files.
+discord.py>=2.3.0
+python-dotenv>=1.0.0

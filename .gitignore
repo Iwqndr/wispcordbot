@@ -1,0 +1,29 @@
+# Secrets — never commit these.
+.env
+.env.*
+!.env.example
+
+# Runtime data. Everything the bot persists lives here and is rebuilt
+# automatically on a fresh install, so it stays out of the repository.
+memberbot_data/
+
+# Python noise.
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# Editor / OS noise.
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
