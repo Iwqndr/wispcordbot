@@ -24,12 +24,25 @@ load_dotenv()
 # CONFIG
 # ---------------------------------------------------------------------------
 
-TOKEN = (os.getenv("MEMBER_BOT_TOKEN") or "").strip()
-COMMAND_PREFIX = (os.getenv("COMMAND_PREFIX") or ">").strip() or ">"
-MEMBER_SITE_URL = (os.getenv("MEMBER_SITE_URL") or "").strip().rstrip("/")
+def _env(name: str) -> str:
+    """Read an environment variable defensively.
 
-SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip().rstrip("/")
-SUPABASE_SERVICE_KEY = (os.getenv("SUPABASE_SERVICE_KEY") or "").strip()
+    Pasting a value into a host's panel very often carries stray whitespace or
+    a pair of quotes along with it, which turns a working key into a 401 with
+    no obvious cause. Both are stripped here.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        raw = raw[1:-1].strip()
+    return raw
+
+
+TOKEN = _env("MEMBER_BOT_TOKEN")
+COMMAND_PREFIX = _env("COMMAND_PREFIX") or ">"
+MEMBER_SITE_URL = _env("MEMBER_SITE_URL").rstrip("/")
+
+SUPABASE_URL = _env("SUPABASE_URL").rstrip("/")
+SUPABASE_SERVICE_KEY = _env("SUPABASE_SERVICE_KEY")
 
 # Bumped by hand when the deployed build changes; lands in the heartbeat row.
 BOT_VERSION = "1.0.0"
@@ -1089,7 +1102,9 @@ async def on_ready():
     else:
         log("MEMBER_SITE_URL is not set — the ticket panel will send plain text.")
     if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-        log("Supabase heartbeat: configured")
+        host = SUPABASE_URL.split("//")[-1].split("/")[0]
+        log(f"Supabase heartbeat: configured -> {host} "
+            f"(key {SUPABASE_SERVICE_KEY[:6]}…, {len(SUPABASE_SERVICE_KEY)} chars)")
     else:
         log("Supabase heartbeat: disabled (SUPABASE_URL / SUPABASE_SERVICE_KEY missing)")
 
@@ -3025,9 +3040,41 @@ async def heartbeat():
         "uptime_seconds": int(time.time() - START_TIME),
     }
     if not supa_upsert("bot_status", row, "id"):
-        log("Heartbeat failed — check SUPABASE_URL / SUPABASE_SERVICE_KEY and the bot_status table.")
+        # Report the actual cause. A bare "heartbeat failed" sends you hunting
+        # when in practice it is one of three things: the key is missing, the
+        # key is wrong, or the table is missing.
+        detail = _supabase_diagnosis()
+        log(f"Heartbeat failed — {detail}")
 
     mirror_economy()
+
+
+def _supabase_diagnosis() -> str:
+    """A short, specific reason the last Supabase write did not land."""
+    if not SUPABASE_URL:
+        return "SUPABASE_URL is not set."
+    if not SUPABASE_SERVICE_KEY:
+        return "SUPABASE_SERVICE_KEY is not set."
+
+    status, raw = supa(
+        "GET",
+        "bot_status?select=id&limit=1",
+        extra_headers={"Prefer": "return=minimal"},
+    )
+    body = (raw or "").strip().replace("\n", " ")[:200]
+
+    if status == 0:
+        return f"the request never completed ({body or 'network error'})."
+    if status in (401, 403):
+        return (f"Supabase rejected the key (HTTP {status}). Check "
+                f"SUPABASE_SERVICE_KEY is the service_role key from "
+                f"Project Settings > API, not the anon key. {body}")
+    if status == 404:
+        return (f"the bot_status table was not found (HTTP 404). Run "
+                f"wispbyte_schema.sql in the Supabase SQL editor. {body}")
+    if status >= 400:
+        return f"HTTP {status}. {body}"
+    return f"unexpected response (HTTP {status}). {body}"
 
 
 def mirror_economy(force: bool = False) -> None:
