@@ -210,8 +210,18 @@ MARRIAGE_REWARDED = set()
 LAST_PASSIVE_PAYOUT = {}
 
 # uid -> checksum of the last economy row pushed to Supabase, so an unchanged
-# member is not re-sent on every sweep.
+# member is not re-sent on every sweep. It doubles as "what this bot last wrote",
+# which is how a row changed by somebody else is recognised.
 _ECONOMY_DIRTY = {}
+
+# How often to look for a currency change made outside the bot (the panel's
+# Currency button, the admin bot's money commands), and how often to re-read the
+# whole table for a row edited by hand in Supabase, which leaves `updated_at`
+# alone and so cannot be found by the cheaper incremental read.
+ECONOMY_PULL_SECONDS = 15
+ECONOMY_SWEEP_SECONDS = 600
+_ECONOMY_LAST_SEEN = ""
+_ECONOMY_LAST_SWEEP = 0.0
 
 LUCKY_CHANCE = 0.05
 QWORK_SECONDS = 120
@@ -3290,12 +3300,124 @@ def _supabase_diagnosis() -> str:
             f"pages/schema.sql. Read probe: {body}")
 
 
-def mirror_economy(force: bool = False) -> None:
-    """Push economy records to the `economy` table, but only what changed.
+def _economy_row(uid, rec, stamp=None) -> dict:
+    """The `economy` table row for one member. `stamp` is only for pushes."""
+    row = {
+        "user_id": str(uid),
+        "balance": int(rec.get("balance", 0)),
+        "bank": int(rec.get("bank", 0)),
+        "xp": int(rec.get("xp", 0)),
+        "level": level_of(rec),
+        "wins": int(rec.get("wins", 0)),
+        "losses": int(rec.get("losses", 0)),
+        "streak": int(rec.get("streak", 0)),
+    }
+    if stamp:
+        row["updated_at"] = stamp
+    return row
 
-    The JSON file stays the source of truth; this is a read-only mirror so the
-    member site can show balances and levels. A failure is logged and skipped,
-    because the bot has to keep running even when the site cannot be reached.
+
+def _economy_digest(row) -> str:
+    """The mirrored fields, checksummed: identical means nothing to send."""
+    def num(key):
+        try:
+            return int(row.get(key) or 0)
+        except Exception:
+            return 0
+
+    return hashlib.sha256(
+        f"{num('balance')}|{num('bank')}|{num('xp')}|{num('level')}|"
+        f"{num('wins')}|{num('losses')}|{num('streak')}".encode("utf-8")
+    ).hexdigest()
+
+
+def adopt_economy_edits(force_all: bool = False) -> int:
+    """Take currency changes made outside this bot from the `economy` table.
+
+    The staff panel's Currency button and the admin bot's money commands both
+    write that table, because it is the one place two separate bots can reach.
+    A row whose numbers differ from what this bot last pushed was changed by
+    someone else, and that change wins: it is what the site is already showing,
+    and the next push would otherwise flatten it back.
+
+    Reads are incremental on `updated_at`, which our own writes set — a row
+    edited by hand in Supabase does not touch that column, so every
+    ECONOMY_SWEEP_SECONDS the whole table is read to catch those too.
+
+    Returns how many records changed.
+    """
+    global _ECONOMY_LAST_SEEN, _ECONOMY_LAST_SWEEP
+
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return 0
+
+    now = time.time()
+    full = (force_all or not _ECONOMY_LAST_SEEN
+            or (now - _ECONOMY_LAST_SWEEP) >= ECONOMY_SWEEP_SECONDS)
+    query = ("economy?select=user_id,balance,bank,xp,level,wins,losses,streak,updated_at"
+             "&order=updated_at.desc&limit=1000")
+    if not full and _ECONOMY_LAST_SEEN:
+        query += f"&updated_at=gt.{urllib.parse.quote(_ECONOMY_LAST_SEEN)}"
+
+    status, raw = supa("GET", query)
+    if status != 200:
+        return 0
+    try:
+        rows = json.loads(raw)
+    except Exception:
+        return 0
+    if not isinstance(rows, list):
+        return 0
+
+    _ECONOMY_LAST_SWEEP = now
+    changed_any = False
+    example = ""
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = str(row.get("updated_at") or "")
+        if stamp > _ECONOMY_LAST_SEEN:
+            _ECONOMY_LAST_SEEN = stamp
+        uid = str(row.get("user_id") or "")
+        if not uid.isdigit():
+            continue
+
+        digest = _economy_digest(row)
+        if _ECONOMY_DIRTY.get(uid) == digest:
+            continue                      # our own last write, nothing to adopt
+        _ECONOMY_DIRTY[uid] = digest      # so the next pass does not repeat this
+
+        rec = acct(uid)
+        fields = ("balance", "bank", "xp", "wins", "losses", "streak")
+        before = {field: int(rec.get(field, 0)) for field in fields}
+        try:
+            wanted = {field: int(row.get(field) or 0) for field in fields}
+        except Exception:
+            continue
+        if before == wanted:
+            continue
+
+        rec.update(wanted)
+        changed_any = True
+        if not example:
+            example = (f"{uid} {before['balance']:,} -> {wanted['balance']:,}"
+                       if before["balance"] != wanted["balance"] else f"{uid} xp/level")
+
+    if changed_any:
+        economy.save()
+        log(f"Economy: adopted a change made outside the bot ({example}).")
+        return 1
+    return 0
+
+
+def mirror_economy(force: bool = False) -> None:
+    """Adopt outside changes, then push economy records that changed here.
+
+    The JSON file is the source of truth for everything the bot itself awards;
+    the table is the source of truth for what an operator changed by hand (see
+    adopt_economy_edits). A failure is logged and skipped, because the bot has
+    to keep running even when the site cannot be reached.
 
     Rows are checksummed and skipped when unchanged, so a quiet server costs one
     small request per pass instead of one row per member every time.
@@ -3304,6 +3426,8 @@ def mirror_economy(force: bool = False) -> None:
 
     if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
         return
+
+    adopt_economy_edits()
 
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     rows = []
@@ -3314,21 +3438,8 @@ def mirror_economy(force: bool = False) -> None:
             continue
         key = str(uid)
         seen.add(key)
-        row = {
-            "user_id": key,
-            "balance": int(rec.get("balance", 0)),
-            "bank": int(rec.get("bank", 0)),
-            "xp": int(rec.get("xp", 0)),
-            "level": level_of(rec),
-            "wins": int(rec.get("wins", 0)),
-            "losses": int(rec.get("losses", 0)),
-            "streak": int(rec.get("streak", 0)),
-            "updated_at": now,
-        }
-        digest = hashlib.sha256(
-            f"{row['balance']}|{row['bank']}|{row['xp']}|{row['level']}|"
-            f"{row['wins']}|{row['losses']}|{row['streak']}".encode("utf-8")
-        ).hexdigest()
+        row = _economy_row(key, rec, now)
+        digest = _economy_digest(row)
         if not force and _ECONOMY_DIRTY.get(key) == digest:
             continue
         _ECONOMY_DIRTY[key] = digest
@@ -3356,6 +3467,22 @@ def mirror_economy(force: bool = False) -> None:
             return
 
 
+@tasks.loop(seconds=ECONOMY_PULL_SECONDS)
+async def economy_sync():
+    """Notice currency changed from the panel or the admin bot, quickly.
+
+    Deliberately on the event loop rather than a thread: it edits the same
+    in-memory records the commands do, and one small request every fifteen
+    seconds is not worth a lock.
+    """
+    mirror_economy()
+
+
+@economy_sync.before_loop
+async def before_economy_sync():
+    await bot.wait_until_ready()
+
+
 @heartbeat.before_loop
 async def before_heartbeat():
     await bot.wait_until_ready()
@@ -3380,6 +3507,7 @@ async def setup_hook():
 
     if SUPABASE_URL and SUPABASE_SERVICE_KEY:
         heartbeat.start()
+        economy_sync.start()
 
 
 # ---------------------------------------------------------------------------
