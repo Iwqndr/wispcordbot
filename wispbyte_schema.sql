@@ -99,6 +99,13 @@ create table if not exists public.bot_status (
   latency_ms   integer default 0
 );
 
+-- Added after the first release, so an existing table needs the ALTER:
+-- `create table if not exists` does nothing to a table that is already there.
+-- The member bot sends uptime_seconds with every heartbeat and retries without
+-- it if the column is missing, so the heartbeat still lands either way — only
+-- the uptime display on the site depends on this.
+alter table public.bot_status add column if not exists uptime_seconds integer default 0;
+
 alter table public.bot_status enable row level security;
 
 -- The member page reads the 'member' row with the anon key to decide whether
@@ -197,7 +204,36 @@ create policy "service full access pending_uploads"
   with check (true);
 
 -- ---------------------------------------------------------------------------
--- 7. Housekeeping — drop attachment slots older than a day.
+-- 7. bot_state — the member bot's own state files (economy, marriages, afk,
+--    reminders, leaderboards, trivia, worker), one row per file.
+--
+--    This is the durable copy of the bot's JSON data: at startup the bot reads
+--    any file it does not have back out of this table, and after every change
+--    it refreshes the row. It is the reason a fresh host, a wiped data
+--    directory or a lost disk no longer means losing balances and streaks.
+--
+--    Nothing on the site reads this table, and anon is deliberately given no
+--    access to it — it holds private things (afk reasons, marriages, reminders)
+--    and only the bot's service key should ever see them.
+-- ---------------------------------------------------------------------------
+create table if not exists public.bot_state (
+  id         text primary key,
+  data       jsonb not null default '{}'::jsonb,
+  updated_at timestamptz default now()
+);
+
+alter table public.bot_state enable row level security;
+
+drop policy if exists "service full access bot_state" on public.bot_state;
+create policy "service full access bot_state"
+  on public.bot_state
+  for all
+  to service_role
+  using (true)
+  with check (true);
+
+-- ---------------------------------------------------------------------------
+-- 8. Housekeeping — drop attachment slots older than a day.
 --    Optional: only run this if `pg_cron` is available on your project.
 -- ---------------------------------------------------------------------------
 -- select cron.schedule(

@@ -107,40 +107,79 @@ def log(message: str) -> None:
 
 # ---------------------------------------------------------------------------
 # STORAGE — tiny JSON files, written atomically
+#
+# Each store also has a row in Supabase's `bot_state` table, so the database is
+# the durable copy and these files are a local cache. Commands only ever touch
+# the file (nothing waits on the network); the row is what a fresh or wiped host
+# restores from at startup, and what gets updated after a change.
 # ---------------------------------------------------------------------------
+
+# Every store created below, so the whole set can be pulled from Supabase once
+# at startup and pushed back when something changes.
+_STORES: list = []
+
+# Store names changed since the last successful push.
+_STATE_DIRTY = set()
+
+# name -> the JSON last pushed, so an untouched store is not rewritten on every
+# sweep. Empty at startup, which is what makes the first pass push everything.
+_STATE_PUSHED = {}
+
+# Whether the startup pull has run, and whether Supabase could actually be read.
+# Writes are refused while the answer to the second one is "no": posting local
+# defaults over a copy we failed to fetch is the one way this could lose data.
+_STATE_PULLED = False
+_STATE_REMOTE_READABLE = None
+_STATE_LAST_PULL = 0.0
+
+# How long to wait before trying Supabase again after a failed read.
+STATE_RETRY_SECONDS = 300.0
 
 
 class JsonStore:
-    """A JSON file that behaves like a dict and can be saved on demand.
+    """A JSON file that behaves like a dict, cached from and to Supabase.
 
     Every write goes to a `.tmp` next to the target and is then replaced, so a
-    crash mid-write can never leave a half-written file behind.
+    crash mid-write can never leave a half-written file behind. `save()` also
+    marks the store for the next state push — see mirror_state().
     """
 
     def __init__(self, filename: str, default=None):
         os.makedirs(DATA_DIR, exist_ok=True)
         self.path = os.path.join(DATA_DIR, filename)
+        self.name = os.path.splitext(filename)[0]   # row id in `bot_state`
         self.default = default if default is not None else {}
+        self.loaded_from_disk = True
         self.data = self._read()
+        _STORES.append(self)
 
     def _read(self):
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
                 return json.load(fh)
         except FileNotFoundError:
+            self.loaded_from_disk = False
             return json.loads(json.dumps(self.default))
         except Exception as exc:  # corrupt file: keep going on a fresh copy
+            self.loaded_from_disk = False
             log(f"Could not read {os.path.basename(self.path)}: {exc}")
             return json.loads(json.dumps(self.default))
 
-    def save(self) -> None:
+    def _write_file(self) -> bool:
         tmp = self.path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self.data, fh, indent=2)
             os.replace(tmp, self.path)
+            return True
         except Exception as exc:
             log(f"Could not write {os.path.basename(self.path)}: {exc}")
+            return False
+
+    def save(self) -> None:
+        """Write the file, then queue the same contents for Supabase."""
+        if self._write_file():
+            _STATE_DIRTY.add(self.name)
 
 
 economy = JsonStore("economy.json")            # uid -> balance/bank/xp/inventory
@@ -265,6 +304,169 @@ def supa_upsert(table: str, row, on_conflict: str) -> bool:
         extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
     )
     return 200 <= status < 300
+
+
+# ---------------------------------------------------------------------------
+# STATE SYNC — the `bot_state` table
+#
+# The JSON files are what the code reads and are always authoritative while
+# they exist. Supabase holds a copy of each one so that a fresh host, a wiped
+# data directory or a lost disk can come back exactly as it was: at startup any
+# file that is missing is rebuilt from its row, and after every save() the row
+# is refreshed on the heartbeat.
+# ---------------------------------------------------------------------------
+
+
+def _state_document(store) -> str:
+    """A store's contents as comparable JSON text (stable key order)."""
+    try:
+        return json.dumps(store.data, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return ""
+
+
+def _state_summary(document) -> str:
+    if isinstance(document, dict):
+        return f"{len(document)} record(s)"
+    if isinstance(document, list):
+        return f"{len(document)} item(s)"
+    return "data"
+
+
+def fetch_state_documents():
+    """Read every `bot_state` row in one request.
+
+    Returns (documents, status, body). `documents` is None whenever the table
+    could not be read, whatever the reason, so a caller can tell "empty table"
+    (a plain {}) from "no answer", which mean very different things.
+    """
+    status, raw = supa("GET", "bot_state?select=id,data", timeout=8)
+    if status != 200:
+        return None, status, raw
+    try:
+        rows = json.loads(raw)
+    except Exception:
+        return None, status, "the response was not JSON"
+    if not isinstance(rows, list):
+        return None, status, "the response was not a list of rows"
+    documents = {}
+    for row in rows:
+        if isinstance(row, dict) and row.get("id") is not None:
+            documents[str(row["id"])] = row.get("data")
+    return documents, status, raw
+
+
+def restore_stores(retry_after: float = 0.0) -> int:
+    """Rebuild any state file this host does not have from Supabase.
+
+    Called at startup before the bot logs in, so nothing can read or write an
+    empty store first. A file that is already there is never touched — the local
+    copy wins — and a fetch that fails leaves pushing switched off until a read
+    succeeds, because the local defaults must never overwrite a copy we could not
+    read. Returns how many files came back.
+    """
+    global _STATE_PULLED, _STATE_REMOTE_READABLE, _STATE_LAST_PULL
+
+    now = time.time()
+    if _STATE_PULLED and retry_after and (now - _STATE_LAST_PULL) < retry_after:
+        return 0
+
+    _STATE_PULLED = True
+    _STATE_LAST_PULL = now
+
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        _STATE_REMOTE_READABLE = False
+        return 0
+
+    documents, status, raw = fetch_state_documents()
+    if documents is None:
+        if status == 404:
+            log("State sync: the bot_state table is missing — run wispbyte_schema.sql in "
+                "the Supabase SQL editor to turn the state backup on.")
+        else:
+            log(f"State sync: could not read bot_state ({status or 'no answer'}) — using the "
+                f"local files only, and holding off on writes until it can be read again. "
+                f"{(raw or '')[:120]}")
+        _STATE_REMOTE_READABLE = False
+        return 0
+
+    _STATE_REMOTE_READABLE = True
+
+    restored = 0
+    for store in _STORES:
+        if store.loaded_from_disk or store.name not in documents:
+            continue
+        document = documents[store.name]
+        if not isinstance(document, (dict, list)):
+            continue
+        store.data = document
+        store.loaded_from_disk = True
+        store._write_file()
+        # It came from the table, so there is nothing to send back.
+        _STATE_PUSHED[store.name] = _state_document(store)
+        restored += 1
+        log(f"State sync: restored {store.name}.json from Supabase "
+            f"({_state_summary(document)}).")
+
+    if restored:
+        log(f"State sync: {restored} file(s) came back from Supabase.")
+    return restored
+
+
+def mirror_state(force: bool = False) -> None:
+    """Push every changed state file to the `bot_state` table.
+
+    Runs on the heartbeat, once a minute: save() only flags a store, so no
+    command ever waits on the network. Documents that have not changed since the
+    last push are skipped, a failure puts the stores back for the next attempt,
+    and nothing is sent while the table could not be read (see restore_stores).
+    """
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return
+
+    if _STATE_REMOTE_READABLE is not True:
+        restore_stores(retry_after=STATE_RETRY_SECONDS)
+        if _STATE_REMOTE_READABLE is not True:
+            return
+
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    pending = []   # (name, document, row)
+
+    for store in _STORES:
+        if not force and store.name not in _STATE_DIRTY:
+            continue
+        document = _state_document(store)
+        if not document:
+            continue
+        if not force and _STATE_PUSHED.get(store.name) == document:
+            _STATE_DIRTY.discard(store.name)
+            continue
+        pending.append((
+            store.name,
+            document,
+            {"id": store.name, "data": store.data, "updated_at": now},
+        ))
+
+    _STATE_DIRTY.clear()
+    if not pending:
+        return
+
+    for start in range(0, len(pending), 100):
+        chunk = pending[start:start + 100]
+        status, raw = supa(
+            "POST",
+            "bot_state?on_conflict=id",
+            data=[row for _, _, row in chunk],
+            extra_headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        if not (200 <= status < 300):
+            # Retry next pass rather than losing the write.
+            _STATE_DIRTY.update(name for name, _, _ in chunk)
+            log(f"State sync: could not save {len(chunk)} state file(s) "
+                f"({status}): {raw[:200]}")
+            return
+        for name, document, _ in chunk:
+            _STATE_PUSHED[name] = document
 
 
 # ---------------------------------------------------------------------------
@@ -3023,12 +3225,13 @@ async def before_reminder_sweep():
 
 @tasks.loop(seconds=60)
 async def heartbeat():
-    """Upsert the `member` row in `bot_status`, then mirror the economy.
+    """Upsert the `member` row in `bot_status`, then push the economy and state.
 
-    The member site reads both with the anon key (RLS allows SELECT) and
+    The member site reads the row with the anon key (RLS allows SELECT) and
     considers the bot online while the timestamp is under three minutes old.
     Any failure is logged once and then ignored — a heartbeat must never take
-    the process down.
+    the process down. `mirror_state()` rides along here because this is the
+    only timer the bot always has: it is what keeps `bot_state` current.
     """
     row = {
         "id": "member",
@@ -3052,6 +3255,7 @@ async def heartbeat():
             log(f"Heartbeat failed — {_supabase_diagnosis()}")
 
     mirror_economy()
+    mirror_state()
 
 
 def _supabase_diagnosis() -> str:
@@ -3160,6 +3364,10 @@ async def before_heartbeat():
 @bot.event
 async def setup_hook():
     """Register the persistent ticket button before the gateway connects."""
+    # Before anything can read or write state: rebuild any data file this host
+    # does not have (a fresh VM, or a wiped data directory) from Supabase.
+    restore_stores()
+
     try:
         bot.add_view(TicketCreationView())
         log("Ticket panel button registered as a persistent view.")
