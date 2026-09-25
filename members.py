@@ -1229,7 +1229,7 @@ MEMBER_HELP = [
     ("Casino", [
         ("slots <bet>", "Play the slot machine"),
         ("blackjack <bet>", "Play blackjack"),
-        ("cf [amount]", "Flip a coin — bet coins, or flip for free"),
+        ("cf <amount>", "Bet coins on a heads-or-tails pick"),
         ("roulette <amount> <bet>", "Red, black or a number. `r25` bets both"),
         ("lottery buy <amount>", "Scratch tickets, enter the weekly pot"),
     ]),
@@ -1635,9 +1635,12 @@ class CoinFlipView(discord.ui.View):
 
 @bot.command(name="coinflip", aliases=["cf"])
 async def coinflip(ctx: commands.Context, bet: str = None):
-    """`>cf` flips for free; `>cf 100` flips for 100 coins."""
+    """`>cf 100` bets 100 coins on a heads-or-tails pick."""
     if bet is None:
-        return await ctx.send(f"> 🪙 {random.choice(['Heads', 'Tails'])}")
+        return await ctx.send(
+            f"> That didn't work — run it with an amount, like "
+            f"`{COMMAND_PREFIX}cf 100` (or `half` / `all`)."
+        )
 
     rec = acct(ctx.author.id)
     amount = parse_bet(bet, rec)
