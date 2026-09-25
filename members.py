@@ -1556,8 +1556,10 @@ async def roll(ctx: commands.Context, dice: str = "1d6"):
 class CoinFlipView(discord.ui.View):
     """Pick a side from the dropdown, then the coin is flipped.
 
-    The bet is escrowed when the command runs and settled when a side is
-    picked, so a member who is robbed mid-flip cannot spend the stake twice.
+    Nothing is deducted up front. `main.py` deliberately kills any previous
+    instance at startup, so restarts are routine, and a view only exists in
+    memory — an escrowed stake would vanish with the process, silently. The
+    bet is settled when a side is picked instead, exactly like blackjack.
     """
 
     def __init__(self, author_id: int, bet: int):
@@ -1579,7 +1581,7 @@ class CoinFlipView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "This flip belongs to someone else — start your own.", ephemeral=True
+                blockquote("This flip belongs to someone else — start your own."), ephemeral=True
             )
             return False
         return True
@@ -1588,12 +1590,9 @@ class CoinFlipView(discord.ui.View):
         if self.finished:
             self.stop()
             return
-        # Nobody picked: refund the escrowed stake rather than keeping it.
+        # Nothing was taken up front, so there is nothing to give back.
         try:
-            add_coins(self.author_id, self.bet)
-            await self.message.edit(
-                content="> The coin was never flipped — your bet was returned.", view=None
-            )
+            await self.message.edit(content="> The coin was never flipped.", view=None)
         except Exception:
             pass
         cleanup_after(self.message)
@@ -1614,19 +1613,35 @@ class CoinFlipView(discord.ui.View):
 
         result = random.choice(["heads", "tails"])
         rec = acct(self.author_id)
+
+        # The wallet may have moved since the command ran — a rob, another bet,
+        # a loan payment — so stake only what is actually there right now.
+        stake = min(self.bet, max(0, int(rec.get("balance", 0))))
+        if stake <= 0:
+            await interaction.message.edit(
+                content="> Your wallet is empty now, so the flip is off. Nothing was taken.",
+                view=self,
+            )
+            cleanup_after(interaction.message)
+            self.stop()
+            return
+
         if choice == result:
-            # The stake was already escrowed, so a win returns it plus a match.
-            rec["balance"] = int(rec.get("balance", 0)) + self.bet * 2
+            rec["balance"] = int(rec.get("balance", 0)) + stake
             rec["wins"] = int(rec.get("wins", 0)) + 1
-            outcome = f"**{result.capitalize()}!** You win **{self.bet:,}** {CURRENCY}."
+            outcome = f"**{result.capitalize()}!** You win **{stake:,}** {CURRENCY}."
         else:
-            # Already deducted at command time; nothing more to take.
+            rec["balance"] = int(rec.get("balance", 0)) - stake
             rec["losses"] = int(rec.get("losses", 0)) + 1
-            outcome = f"**{result.capitalize()}.** You lose **{self.bet:,}** {CURRENCY}."
+            outcome = f"**{result.capitalize()}.** You lose **{stake:,}** {CURRENCY}."
         economy.save()
 
+        note = ""
+        if stake < self.bet:
+            note = f"\n> Your wallet only held **{stake:,}** of the **{self.bet:,}** you bet."
         await interaction.message.edit(
-            content=f"> 🪙 {outcome}\n> Wallet {int(rec['balance']):,} · Bank {int(rec['bank']):,}",
+            content=(f"> 🪙 {outcome}{note}\n"
+                     f"> Wallet {int(rec['balance']):,} · Bank {int(rec['bank']):,}"),
             view=self,
         )
         cleanup_after(interaction.message)
@@ -1647,10 +1662,8 @@ async def coinflip(ctx: commands.Context, bet: str = None):
     if amount is None:
         return await ctx.send("> That bet doesn't work. Try `10`, `half` or `all`.")
 
-    # Escrow the stake now; the view pays out (or keeps) it on the pick.
-    rec["balance"] = int(rec["balance"]) - amount
-    economy.save()
-
+    # Validated here so a nonsense bet never opens a dropdown, but not charged:
+    # the stake is taken at pick time, so a restart cannot swallow it.
     view = CoinFlipView(ctx.author.id, amount)
     await try_delete(ctx.message)
     view.message = await ctx.send(
@@ -2093,7 +2106,7 @@ class ChoiceView(discord.ui.View):
     def _make_callback(self, index: int):
         async def callback(interaction: discord.Interaction):
             if interaction.user.id != self.author_id:
-                return await interaction.response.send_message("This one is someone else's — start your own.", ephemeral=True)
+                return await interaction.response.send_message(blockquote("This one is someone else's — start your own."), ephemeral=True)
             if self.answered:
                 return await interaction.response.defer()
             self.answered = True
@@ -2119,9 +2132,9 @@ async def trivia(ctx: commands.Context):
             key = str(interaction.user.id)
             trivia_store.data["scores"][key] = trivia_store.data["scores"].get(key, 0) + 1
             trivia_store.save()
-            await interaction.followup.send(f"Correct! +75 {CURRENCY}")
+            await interaction.followup.send(blockquote(f"Correct! +75 {CURRENCY}"))
         else:
-            await interaction.followup.send(f"Not quite — it was **{options[correct]}**.")
+            await interaction.followup.send(blockquote(f"Not quite — it was **{options[correct]}**."))
 
     view = ChoiceView(options, correct, ctx.author.id, on_result)
     view.message = await ctx.send(embed=discord.Embed(title=question, color=discord.Color.blurple()), view=view)
@@ -2138,9 +2151,9 @@ async def flags(ctx: commands.Context):
     async def on_result(interaction, correct_answer: bool):
         if correct_answer:
             add_coins(interaction.user.id, 50)
-            await interaction.followup.send(f"Correct — **{country}**! +50 {CURRENCY}")
+            await interaction.followup.send(blockquote(f"Correct — **{country}**! +50 {CURRENCY}"))
         else:
-            await interaction.followup.send(f"That was **{country}**.")
+            await interaction.followup.send(blockquote(f"That was **{country}**."))
 
     view = ChoiceView(options, correct, ctx.author.id, on_result)
     view.message = await ctx.send(
@@ -2251,7 +2264,7 @@ class HangmanView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "This is someone else's game — start your own with `>hangman`.", ephemeral=True
+                blockquote("This is someone else's game — start your own with `>hangman`."), ephemeral=True
             )
             return False
         return True
@@ -2281,11 +2294,11 @@ class HangmanView(discord.ui.View):
     async def _on_guess(self, interaction: discord.Interaction):
         state = HANGMAN.get(self.channel_id)
         if not state:
-            return await interaction.response.send_message("That game is over.", ephemeral=True)
+            return await interaction.response.send_message(blockquote("That game is over."), ephemeral=True)
 
         letter = str((interaction.data or {}).get("values", ["-"])[0]).lower()
         if letter == "-" or letter in state["guessed"]:
-            return await interaction.response.send_message("Already tried that one.", ephemeral=True)
+            return await interaction.response.send_message(blockquote("Already tried that one."), ephemeral=True)
 
         state["guessed"].add(letter)
         state["touch"] = time.time()
@@ -2815,7 +2828,7 @@ class BlackjackView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message("This hand belongs to someone else.", ephemeral=True)
+            await interaction.response.send_message(blockquote("This hand belongs to someone else."), ephemeral=True)
             return False
         return True
 
@@ -3613,7 +3626,7 @@ class TicketConfirmView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         await interaction.response.edit_message(
-            content="Cancelled. You can reopen the panel any time.",
+            content=blockquote("Cancelled. You can reopen the panel any time."),
             view=self,
         )
         self.stop()
@@ -3645,10 +3658,10 @@ class TicketCreationView(discord.ui.View):
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not SUPPORT_PAGE_URL:
             return await interaction.response.send_message(
-                "Click the support page link to open a ticket.", ephemeral=True
+                blockquote("Click the support page link to open a ticket."), ephemeral=True
             )
         await interaction.response.send_message(
-            "You are about to be redirected to our support page.",
+            blockquote("You are about to be redirected to our support page."),
             view=TicketConfirmView(),
             ephemeral=True,
         )
@@ -3852,6 +3865,9 @@ def _economy_row(uid, rec, stamp=None) -> dict:
         "wins": int(rec.get("wins", 0)),
         "losses": int(rec.get("losses", 0)),
         "streak": int(rec.get("streak", 0)),
+        # Mirrored so the panel can see a debt and forgive it.
+        "loan_owed": int(rec.get("loan_owed", 0)),
+        "loan_principal": int(rec.get("loan_principal", 0)),
     }
     if stamp:
         row["updated_at"] = stamp
@@ -3868,7 +3884,8 @@ def _economy_digest(row) -> str:
 
     return hashlib.sha256(
         f"{num('balance')}|{num('bank')}|{num('xp')}|{num('level')}|"
-        f"{num('wins')}|{num('losses')}|{num('streak')}".encode("utf-8")
+        f"{num('wins')}|{num('losses')}|{num('streak')}|"
+        f"{num('loan_owed')}|{num('loan_principal')}".encode("utf-8")
     ).hexdigest()
 
 
@@ -3895,7 +3912,8 @@ def adopt_economy_edits(force_all: bool = False) -> int:
     now = time.time()
     full = (force_all or not _ECONOMY_LAST_SEEN
             or (now - _ECONOMY_LAST_SWEEP) >= ECONOMY_SWEEP_SECONDS)
-    query = ("economy?select=user_id,balance,bank,xp,level,wins,losses,streak,updated_at"
+    query = ("economy?select=user_id,balance,bank,xp,level,wins,losses,streak,"
+             "loan_owed,loan_principal,updated_at"
              "&order=updated_at.desc&limit=1000")
     if not full and _ECONOMY_LAST_SEEN:
         query += f"&updated_at=gt.{urllib.parse.quote(_ECONOMY_LAST_SEEN)}"
@@ -3930,7 +3948,8 @@ def adopt_economy_edits(force_all: bool = False) -> int:
         _ECONOMY_DIRTY[uid] = digest      # so the next pass does not repeat this
 
         rec = acct(uid)
-        fields = ("balance", "bank", "xp", "wins", "losses", "streak")
+        fields = ("balance", "bank", "xp", "wins", "losses", "streak",
+                  "loan_owed", "loan_principal")
         before = {field: int(rec.get(field, 0)) for field in fields}
         try:
             wanted = {field: int(row.get(field) or 0) for field in fields}
