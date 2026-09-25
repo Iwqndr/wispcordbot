@@ -2,7 +2,6 @@ import asyncio
 import collections
 import datetime
 import hashlib
-import io
 import json
 import math
 import os
@@ -189,6 +188,9 @@ worker = JsonStore("worker.json")              # uid -> kind/started_at/last_tic
 marriages = JsonStore("marriages.json")        # guild -> uid -> partner uid
 afk = JsonStore("afk.json")                    # guild -> uid -> reason/since
 reminders = JsonStore("reminders.json")        # uid -> text/due_at
+lottery = JsonStore("lottery.json", {          # the weekly pot and its entries
+    "pot": 0, "tickets": {}, "history": [], "draws": 0, "next_draw": 0,
+})
 
 # Live game state that does not need to survive a restart. Each entry carries a
 # `touch` timestamp so abandoned games can be swept — see sweep_game_state().
@@ -228,6 +230,35 @@ QWORK_SECONDS = 120
 QWORK_COOLDOWN = 300
 WORK_CAP_SECONDS = 28800
 REMINDER_MAX_SECONDS = 30 * 86400
+
+# LOANS — one at a time, and it has to be cleared before borrowing again.
+# Interest is flat rather than per-day: the debt is capped and small, and a
+# compounding rate would punish exactly the member who is saving up to repay.
+LOAN_MAX = 10000
+LOAN_INTEREST = 0.10
+# The share of every daily/job payout that is taken off the debt until it is
+# gone. Applied where the coins are credited, so it can never double-charge.
+LOAN_DEDUCTION = 0.25
+
+# LOTTERY — one pot, drawn weekly. A ticket is scratched the moment it is
+# bought (so buying is immediately fun) but the ticket still rides in the pot,
+# which is what keeps people coming back for the draw.
+LOTTERY_TICKET_PRICE = 250
+LOTTERY_MAX_TICKETS = 8
+# The share of every ticket that goes into the pot rather than the house.
+LOTTERY_POT_SHARE = 0.8
+LOTTERY_WEEK_SECONDS = 7 * 86400
+
+# (name, weight, ((chance, coins), ...)) — the scratch table. The chances are
+# per ticket and independent, so a "Golden Ticket" is a type, not a promise:
+# it just has the best table. Weights are relative, not percentages.
+LOTTERY_TYPES = (
+    ("Golden Ticket", 8, ((0.05, 2_000), (0.004, 10_000))),
+    ("Mystery Ticket", 18, ((0.15, 150), (0.01, 1_000))),
+    ("Lucky Sevens", 24, ((0.07, 250), (0.008, 777))),
+    ("Scratch & Win", 32, ((0.10, 100), (0.02, 500))),
+    ("Dud", 18, ()),
+)
 
 # 30+ job names, shared by `>qwork` and `>work`. Cosmetics only.
 JOB_NAMES = [
@@ -713,6 +744,11 @@ def acct(uid) -> dict:
     rec.setdefault("qwork_welcomed", False)
     rec.setdefault("streak", 0)
     rec.setdefault("best_streak", 0)
+    rec.setdefault("loan_owed", 0)
+    rec.setdefault("loan_principal", 0)
+    rec.setdefault("loan_taken_at", 0)
+    rec.setdefault("loans_taken", 0)
+    rec.setdefault("loans_repaid", 0)
     return rec
 
 
@@ -1038,142 +1074,6 @@ def fetch_gif(kind: str):
     return None
 
 
-# ---------------------------------------------------------------------------
-# QUOTE CARD — Pillow, run off the event loop
-# ---------------------------------------------------------------------------
-
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except Exception:  # Pillow missing: `>quote` falls back to plain text
-    Image = ImageDraw = ImageFont = None
-
-QUOTE_ACCENT = (88, 101, 242)
-QUOTE_MAX_CHARS = 600
-QUOTE_WRAP_COLUMNS = 60
-QUOTE_MAX_LINES = 8
-
-FONT_PATHS = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans.ttf",
-)
-FONT_BOLD_PATHS = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-)
-
-
-def pick_font(paths, size: int):
-    """First font file that exists, else Pillow's small built-in default."""
-    if ImageFont is None:
-        return None
-    for path in paths:
-        if os.path.exists(path):
-            try:
-                return ImageFont.truetype(path, size)
-            except Exception:
-                continue
-    try:
-        return ImageFont.load_default()
-    except Exception:
-        return None
-
-
-def wrap_quote(text: str, columns: int = QUOTE_WRAP_COLUMNS):
-    """Word-wrap to `columns`, hard-splitting words that are longer."""
-    lines = []
-    for paragraph in str(text).splitlines() or [""]:
-        words = paragraph.split()
-        if not words:
-            lines.append("")
-            continue
-        current = ""
-        for word in words:
-            while len(word) > columns:
-                if current:
-                    lines.append(current)
-                    current = ""
-                lines.append(word[:columns])
-                word = word[columns:]
-            candidate = f"{current} {word}".strip()
-            if len(candidate) <= columns:
-                current = candidate
-            else:
-                if current:
-                    lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-    return lines
-
-
-def _circle_avatar(data: bytes, size: int):
-    image = Image.open(io.BytesIO(data)).convert("RGBA").resize((size, size), Image.LANCZOS)
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).ellipse((0, 0, size - 1, size - 1), fill=255)
-    image.putalpha(mask)
-    return image
-
-
-def _paste_circle(card, data: bytes, box, size: int) -> None:
-    avatar = _circle_avatar(data, size)
-    card.paste(avatar, box, avatar)
-
-
-def render_quote_card(text: str, display_name: str, stamp: str, accent, avatar_bytes: bytes, bot_name: str, bot_icon=None) -> bytes:
-    """The PNG bytes for one quote card. Raises on any failure — the caller
-    turns that into the plain-text fallback."""
-    if Image is None or ImageDraw is None:
-        raise RuntimeError("Pillow is not installed")
-
-    body = str(text)[:QUOTE_MAX_CHARS]
-    lines = wrap_quote(body)
-    truncated = len(lines) > QUOTE_MAX_LINES
-    lines = lines[:QUOTE_MAX_LINES]
-    if truncated and lines:
-        lines[-1] = (lines[-1][: QUOTE_WRAP_COLUMNS - 1].rstrip() + "\u2026")
-
-    font_name = pick_font(FONT_BOLD_PATHS, 27)
-    font_stamp = pick_font(FONT_PATHS, 17)
-    font_body = pick_font(FONT_PATHS, 23)
-    font_footer = pick_font(FONT_PATHS, 15)
-
-    pad = 30
-    avatar_size = 96
-    text_left = pad + avatar_size + 26
-    line_height = 33
-    width = 940
-    height = pad + 40 + max(1, len(lines)) * line_height + 44 + pad
-    height = max(height, 210)
-
-    card = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(card)
-    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=22, fill=(30, 33, 40, 255))
-    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=22, outline=tuple(accent) + (255,), width=2)
-    draw.rounded_rectangle((0, 0, 7, height - 1), radius=3, fill=tuple(accent) + (255,))
-
-    _paste_circle(card, avatar_bytes, (pad, pad + 4), avatar_size)
-
-    draw.text((text_left, pad), display_name[:44], font=font_name, fill=(255, 255, 255, 255))
-    draw.text((text_left, pad + 38), stamp, font=font_stamp, fill=(160, 168, 182, 255))
-
-    y = pad + 76
-    for line in lines:
-        draw.text((text_left, y), line, font=font_body, fill=(226, 230, 238, 255))
-        y += line_height
-
-    footer_y = height - pad - 14
-    if bot_icon:
-        try:
-            _paste_circle(card, bot_icon, (pad, footer_y - 4), 22)
-        except Exception:
-            pass
-    draw.text((pad + 30, footer_y), str(bot_name)[:32], font=font_footer, fill=(140, 148, 162, 255))
-
-    buffer = io.BytesIO()
-    card.convert("RGB").save(buffer, format="PNG")
-    return buffer.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -1186,12 +1086,68 @@ intents.guilds = True
 intents.members = True
 intents.reactions = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+
+def blockquote(text: str) -> str:
+    """Wrap a reply in Discord's quote box by prefixing each line with `>`.
+
+    The `>` marker is what draws the thin bar down the left of a message, and
+    one marker per line keeps a multi-line reply inside a single box rather
+    than starting a new one. Lines that already carry a marker are left alone,
+    so a reply written as `> ...` by hand is not double-prefixed. A blank line
+    gets a bare `>` instead of `> `, because that is what stops Discord from
+    ending the quote early and leaving the rest of the message outside it.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    lines = []
+    for line in text.split("\n"):
+        if not line:
+            lines.append(">")
+        elif line.lstrip().startswith(">"):
+            lines.append(line)
+        else:
+            lines.append(f"> {line}")
+    return "\n".join(lines)
+
+
+class WispContext(commands.Context):
+    """A context whose plain-text replies are always blockquoted.
+
+    Doing this here rather than at ~120 call sites means every command — the
+    existing ones and anything added later — gets the same box for free, and
+    `send_clean` inherits it because it goes through `ctx.send` too.
+
+    Only `content` is touched. Embeds are deliberately left alone: `>` inside
+    an embed is a literal character, not a quote box, so prefixing one would
+    just add noise. The same goes for interactions (`interaction.response`),
+    which never reach this method and are quoted by hand where it matters.
+    """
+
+    async def send(self, content=None, **kwargs):
+        if kwargs.pop("raw_text", False):
+            return await super().send(content, **kwargs)
+        return await super().send(blockquote(content), **kwargs)
+
+
+class WispBot(commands.Bot):
+    """A bot that builds every invocation context as a `WispContext`.
+
+    discord.py 2.x has no `cls=` constructor option — `get_context` takes the
+    factory as a call-time parameter that defaults to plain `Context`, and a
+    `cls` passed to `Bot(...)` is silently swallowed by `**options`. So the
+    default is overridden here instead; `process_commands` routes through this
+    method, which is what puts the override in the path of every command.
+    """
+
+    async def get_context(self, origin, /, *, cls=WispContext):
+        return await super().get_context(origin, cls=cls)
+
+
+bot = WispBot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 
 MEMBER_HELP = [
     ("Fun", [
         ("roll [4d6+2]", "Roll dice, with optional modifiers"),
-        ("coinflip", "Flip a coin"),
         ("8ball <question>", "Ask the magic 8-ball"),
         ("choose a | b | c", "Pick one of your options"),
         ("rate <thing>", "Rate anything out of 10"),
@@ -1258,15 +1214,24 @@ MEMBER_HELP = [
         ("balance", "Show your coins"),
         ("bank deposit <amount>", "Move coins into your bank"),
         ("bank withdraw <amount>", "Move coins out of your bank"),
+        ("deposit all", "Shortcut for `bank deposit`"),
+        ("withdraw all", "Shortcut for `bank withdraw`"),
+        ("pay @user <amount>", "Give coins to someone"),
+        ("loan <amount>", "Borrow up to 10,000 coins at 10% interest"),
+        ("loan repay <amount>", "Pay a loan off early"),
         ("richest", "The richest member right now"),
         ("work", "Start or stop a passive job"),
         ("qwork", "Quick 2-minute job"),
-        ("slots <bet>", "Play the slot machine"),
-        ("blackjack <bet>", "Play blackjack"),
         ("rob @user", "Try to rob someone"),
         ("shop", "Browse the shop"),
         ("shop buy <item>", "Buy an item"),
-        ("gift @user <amount>", "Give coins to someone"),
+    ]),
+    ("Casino", [
+        ("slots <bet>", "Play the slot machine"),
+        ("blackjack <bet>", "Play blackjack"),
+        ("cf [amount]", "Flip a coin — bet coins, or flip for free"),
+        ("roulette <amount> <bet>", "Red, black or a number. `r25` bets both"),
+        ("lottery buy <amount>", "Scratch tickets, enter the weekly pot"),
     ]),
     ("Social", [
         ("baltop", "Richest members"),
@@ -1277,7 +1242,6 @@ MEMBER_HELP = [
         ("profile [@user]", "Your profile card"),
         ("compare @a @b", "Compare two members"),
         ("stats", "Bot statistics"),
-        ("quote", "Turn a replied-to message into an image"),
         ("reminder <duration> <text>", "Set a reminder"),
         ("reminders", "Show your pending reminder"),
         ("remindercancel", "Cancel your pending reminder"),
@@ -1589,9 +1553,106 @@ async def roll(ctx: commands.Context, dice: str = "1d6"):
     await ctx.send(f"{text} (total {total})")
 
 
+class CoinFlipView(discord.ui.View):
+    """Pick a side from the dropdown, then the coin is flipped.
+
+    The bet is escrowed when the command runs and settled when a side is
+    picked, so a member who is robbed mid-flip cannot spend the stake twice.
+    """
+
+    def __init__(self, author_id: int, bet: int):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.bet = bet
+        self.message = None
+        self.finished = False
+        self.select = discord.ui.Select(
+            placeholder="Choose heads or tails…",
+            options=[
+                discord.SelectOption(label="Heads", value="heads", emoji="🪙"),
+                discord.SelectOption(label="Tails", value="tails", emoji="🪙"),
+            ],
+        )
+        self.select.callback = self._on_pick
+        self.add_item(self.select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "This flip belongs to someone else — start your own.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def on_timeout(self) -> None:
+        if self.finished:
+            self.stop()
+            return
+        # Nobody picked: refund the escrowed stake rather than keeping it.
+        try:
+            add_coins(self.author_id, self.bet)
+            await self.message.edit(
+                content="> The coin was never flipped — your bet was returned.", view=None
+            )
+        except Exception:
+            pass
+        cleanup_after(self.message)
+        self.stop()
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        if self.finished:
+            return await interaction.response.defer()
+        self.finished = True
+        for child in self.children:
+            child.disabled = True
+
+        choice = self.select.values[0]
+        await interaction.response.edit_message(
+            content=f"> Flipping… you called **{choice}**.", view=self
+        )
+        await asyncio.sleep(1.2)
+
+        result = random.choice(["heads", "tails"])
+        rec = acct(self.author_id)
+        if choice == result:
+            # The stake was already escrowed, so a win returns it plus a match.
+            rec["balance"] = int(rec.get("balance", 0)) + self.bet * 2
+            rec["wins"] = int(rec.get("wins", 0)) + 1
+            outcome = f"**{result.capitalize()}!** You win **{self.bet:,}** {CURRENCY}."
+        else:
+            # Already deducted at command time; nothing more to take.
+            rec["losses"] = int(rec.get("losses", 0)) + 1
+            outcome = f"**{result.capitalize()}.** You lose **{self.bet:,}** {CURRENCY}."
+        economy.save()
+
+        await interaction.message.edit(
+            content=f"> 🪙 {outcome}\n> Wallet {int(rec['balance']):,} · Bank {int(rec['bank']):,}",
+            view=self,
+        )
+        cleanup_after(interaction.message)
+        self.stop()
+
+
 @bot.command(name="coinflip", aliases=["cf"])
-async def coinflip(ctx: commands.Context):
-    await ctx.send(f"> {random.choice(['Heads', 'Tails'])}")
+async def coinflip(ctx: commands.Context, bet: str = None):
+    """`>cf` flips for free; `>cf 100` flips for 100 coins."""
+    if bet is None:
+        return await ctx.send(f"> 🪙 {random.choice(['Heads', 'Tails'])}")
+
+    rec = acct(ctx.author.id)
+    amount = parse_bet(bet, rec)
+    if amount is None:
+        return await ctx.send("> That bet doesn't work. Try `10`, `half` or `all`.")
+
+    # Escrow the stake now; the view pays out (or keeps) it on the pick.
+    rec["balance"] = int(rec["balance"]) - amount
+    economy.save()
+
+    view = CoinFlipView(ctx.author.id, amount)
+    await try_delete(ctx.message)
+    view.message = await ctx.send(
+        f"> 🪙 Betting **{amount:,}** {CURRENCY} — pick heads or tails.", view=view
+    )
 
 
 @bot.command(name="8ball")
@@ -2319,18 +2380,22 @@ async def daily(ctx: commands.Context):
     base = 250
     bonus = random.randint(0, 150)
     total = int((base + bonus) * multiplier)
+    paid, net = apply_loan_payment(ctx.author.id, total)
+    if paid:
+        total = net
     rec["balance"] += total
     rec["last_daily"] = now
     add_xp(ctx.author.id, 20)
     economy.save()
 
+    lines = [f"> Daily claimed: **{total}** {CURRENCY} (base {base} + bonus {bonus}, "
+             f"streak {rec['streak']} · x{multiplier:g})."]
+    deduction = _loan_line(paid, loan_balance(rec))
+    if deduction:
+        lines.append(deduction)
+
     await try_delete(ctx.message)
-    await send_clean(
-        ctx,
-        content=(f"> Daily claimed: **{total}** {CURRENCY} (base {base} + bonus {bonus}, "
-                 f"streak {rec['streak']} · x{multiplier:g})."),
-        delete_after=15,
-    )
+    await send_clean(ctx, content="\n".join(lines), delete_after=15)
 
 
 @bot.command(name="streak")
@@ -2352,14 +2417,14 @@ async def streak(ctx: commands.Context):
     await ctx.send(embed=embed)
 
 
-@bot.command(name="bank")
-async def bank(ctx: commands.Context, action: str = None, amount: str = None):
-    """`>bank deposit 500` / `>bank withdraw all`"""
+async def _bank_move(ctx: commands.Context, deposit: bool, amount: str = None):
+    """Move coins between wallet and bank. Shared by all three spellings.
+
+    `>bank deposit`, `>deposit` and `>withdraw` are the same operation with a
+    different word order, so the body lives here once and the commands below
+    are thin wrappers around it.
+    """
     rec = acct(ctx.author.id)
-    verb = (action or "").strip().lower()
-    if verb not in ("deposit", "withdraw", "dep", "with", "w"):
-        return await ctx.send(f"> Use `{COMMAND_PREFIX}bank deposit <amount>` or `{COMMAND_PREFIX}bank withdraw <amount>`.")
-    deposit = verb in ("deposit", "dep")
     available = int(rec["balance"] if deposit else rec["bank"])
     if amount is None:
         return await ctx.send("> How much? A number, `all` or `half`.")
@@ -2379,6 +2444,167 @@ async def bank(ctx: commands.Context, action: str = None, amount: str = None):
         content=(f"> {'Deposited' if deposit else 'Withdrew'} **{value:,}** {CURRENCY}. "
                  f"Wallet {rec['balance']:,} · Bank {rec['bank']:,}"),
         delete_after=15,
+    )
+
+
+@bot.command(name="bank")
+async def bank(ctx: commands.Context, action: str = None, amount: str = None):
+    """`>bank deposit 500` / `>bank withdraw all`"""
+    verb = (action or "").strip().lower()
+    if verb not in ("deposit", "withdraw", "dep", "with", "w"):
+        return await ctx.send(
+            f"> Use `{COMMAND_PREFIX}deposit <amount>` or `{COMMAND_PREFIX}withdraw <amount>`."
+        )
+    await _bank_move(ctx, verb in ("deposit", "dep"), amount)
+
+
+@bot.command(name="deposit", aliases=["dep"])
+async def deposit(ctx: commands.Context, amount: str = None):
+    """`>deposit all` — shorthand for `>bank deposit`."""
+    await _bank_move(ctx, True, amount)
+
+
+@bot.command(name="withdraw", aliases=["with", "w"])
+async def withdraw(ctx: commands.Context, amount: str = None):
+    """`>withdraw all` — shorthand for `>bank withdraw`."""
+    await _bank_move(ctx, False, amount)
+
+
+def loan_balance(rec: dict) -> int:
+    return int(rec.get("loan_owed", 0))
+
+
+def apply_loan_payment(uid, amount: int):
+    """Take the loan's cut out of a payout. Returns `(paid, remainder)`.
+
+    Called at the exact point coins are credited (daily, quick work, passive
+    work) rather than from a sweep, so a member can never be charged twice for
+    the same payout or dodge the debt by cashing out mid-sweep.
+    """
+    rec = acct(uid)
+    owed = loan_balance(rec)
+    amount = int(amount)
+    if owed <= 0 or amount <= 0:
+        return 0, amount
+
+    paid = min(owed, amount, max(1, int(amount * LOAN_DEDUCTION)))
+    rec["loan_owed"] = owed - paid
+    if rec["loan_owed"] <= 0:
+        # Fully cleared: forget the loan so a new one can be taken.
+        rec["loan_owed"] = 0
+        rec["loan_principal"] = 0
+        rec["loan_taken_at"] = 0
+        rec["loans_repaid"] = int(rec.get("loans_repaid", 0)) + 1
+    economy.save()
+    return paid, amount - paid
+
+
+def _loan_line(paid: int, owed: int) -> str:
+    """The `> loan` footnote appended to a payout that was docked."""
+    if not paid:
+        return ""
+    if owed <= 0:
+        return f"> Loan repayment of **{paid:,}** {CURRENCY} — that was the last of it. You are debt-free!"
+    return f"> Loan repayment of **{paid:,}** {CURRENCY} · **{owed:,}** {CURRENCY} still owed."
+
+
+@bot.command(name="loan")
+async def loan(ctx: commands.Context, action: str = None, amount: str = None):
+    """`>loan 500` borrows, `>loan repay 200` pays early, `>loan` shows the debt."""
+    rec = acct(ctx.author.id)
+    owed = loan_balance(rec)
+    verb = (action or "").strip().lower()
+
+    # --- status: `>loan` / `>loan status` ---------------------------------
+    if not verb or verb in ("status", "info", "check"):
+        if owed <= 0:
+            return await ctx.send(
+                f"> You have no loan outstanding. Borrow up to **{LOAN_MAX:,}** {CURRENCY} "
+                f"with `{COMMAND_PREFIX}loan <amount>`."
+            )
+        principal = int(rec.get("loan_principal", 0))
+        taken = float(rec.get("loan_taken_at", 0))
+        embed = discord.Embed(title=f"{ctx.author.display_name}'s loan", color=discord.Color.dark_red())
+        embed.add_field(name="Borrowed", value=f"{principal:,} {CURRENCY}")
+        embed.add_field(name="Still owed", value=f"{owed:,} {CURRENCY}")
+        embed.add_field(name="Interest", value=f"{int(LOAN_INTEREST * 100)}% flat")
+        embed.add_field(
+            name="Auto-repayment",
+            value=f"{int(LOAN_DEDUCTION * 100)}% of every daily and job payout",
+            inline=False,
+        )
+        if taken:
+            embed.set_footer(text=f"Taken {human_delta(time.time() - taken)} ago")
+        return await ctx.send(embed=embed)
+
+    # --- early repayment: `>loan repay <amount>` --------------------------
+    if verb in ("repay", "pay", "payoff", "clear"):
+        if owed <= 0:
+            return await ctx.send("> You don't owe anything.")
+        if amount is None:
+            return await ctx.send(f"> How much do you want to repay? `{COMMAND_PREFIX}loan repay all`.")
+        cash = int(rec.get("balance", 0))
+        value = parse_amount(amount, min(cash, owed))
+        if value is None:
+            return await ctx.send(
+                f"> That amount doesn't work. You have **{cash:,}** {CURRENCY} in your wallet "
+                f"and owe **{owed:,}**."
+            )
+        rec["balance"] = cash - value
+        rec["loan_owed"] = owed - value
+        cleared = rec["loan_owed"] <= 0
+        if cleared:
+            rec["loan_owed"] = 0
+            rec["loan_principal"] = 0
+            rec["loan_taken_at"] = 0
+            rec["loans_repaid"] = int(rec.get("loans_repaid", 0)) + 1
+        economy.save()
+        await try_delete(ctx.message)
+        if cleared:
+            return await send_clean(
+                ctx,
+                content=f"> Repaid **{value:,}** {CURRENCY}. Your loan is cleared — you can borrow again.",
+                delete_after=15,
+            )
+        return await send_clean(
+            ctx,
+            content=(f"> Repaid **{value:,}** {CURRENCY}. **{rec['loan_owed']:,}** {CURRENCY} left to go. "
+                     f"Wallet {rec['balance']:,}"),
+            delete_after=15,
+        )
+
+    # --- borrowing: `>loan <amount>` --------------------------------------
+    if owed > 0:
+        return await ctx.send(
+            f"> You still owe **{owed:,}** {CURRENCY}. Clear that one first — "
+            f"`{COMMAND_PREFIX}loan repay <amount>`, or let your daily and job payouts pay it down."
+        )
+    if not verb.isdigit() or int(verb) < 1:
+        return await ctx.send(
+            f"> Borrow a number between 1 and {LOAN_MAX:,}: `{COMMAND_PREFIX}loan 500`."
+        )
+    principal = int(verb)
+    if principal > LOAN_MAX:
+        return await ctx.send(
+            f"> The most you can borrow is **{LOAN_MAX:,}** {CURRENCY}. "
+            f"Try `{COMMAND_PREFIX}loan {LOAN_MAX}`."
+        )
+
+    rec["loan_principal"] = principal
+    rec["loan_owed"] = int(math.ceil(principal * (1 + LOAN_INTEREST)))
+    rec["loan_taken_at"] = time.time()
+    rec["loans_taken"] = int(rec.get("loans_taken", 0)) + 1
+    rec["balance"] = int(rec.get("balance", 0)) + principal
+    economy.save()
+
+    await try_delete(ctx.message)
+    await send_clean(
+        ctx,
+        content=(f"> You borrowed **{principal:,}** {CURRENCY}. "
+                 f"You owe **{rec['loan_owed']:,}** {CURRENCY} at {int(LOAN_INTEREST * 100)}% interest.\n"
+                 f"> {int(LOAN_DEDUCTION * 100)}% of every daily and job payout will be taken automatically "
+                 f"until it is cleared. Pay it off early with `{COMMAND_PREFIX}loan repay <amount>`."),
+        delete_after=20,
     )
 
 
@@ -2462,17 +2688,21 @@ async def _finish_passive(key: str, announce: bool = True):
         coins *= 2
 
     rec = acct(key)
-    rec["balance"] = int(rec.get("balance", 0)) + coins
+    paid, net = apply_loan_payment(key, coins)
+    rec["balance"] = int(rec.get("balance", 0)) + net
     rec["last_work"] = time.time()
     WORK_COOLDOWN_UNTIL[key] = time.time() + work_cooldown_for(minutes)
     economy.save()
     worker.data.pop(key, None)
     worker.save()
-    LAST_PASSIVE_PAYOUT[key] = (coins, minutes)
+    LAST_PASSIVE_PAYOUT[key] = (net, minutes, paid)
 
     lines = [f"> Clocked out after **{minutes}** minute{'s' if minutes != 1 else ''} — you earned **{coins}** {CURRENCY}."]
     if lucky:
         lines.append("> Lucky bonus! Your payout was doubled.")
+    deduction = _loan_line(paid, loan_balance(rec))
+    if deduction:
+        lines.append(deduction)
     return lines
 
 
@@ -2652,6 +2882,353 @@ async def blackjack(ctx: commands.Context, bet: str = "10"):
     view.message = await ctx.send(view._text(), view=view)
 
 
+# ---------------------------------------------------------------------------
+# LOTTERY
+# ---------------------------------------------------------------------------
+
+
+def lottery_state() -> dict:
+    """The lottery record, with every field present.
+
+    `next_draw` is seeded on first touch rather than at import, so a host that
+    has never run the lottery starts its first week from whenever that happens
+    instead of from an epoch timestamp.
+    """
+    data = lottery.data
+    if not isinstance(data, dict):
+        data = lottery.data = {}
+    data.setdefault("pot", 0)
+    data.setdefault("draws", 0)
+    if not isinstance(data.get("tickets"), dict):
+        data["tickets"] = {}
+    if not isinstance(data.get("history"), list):
+        # The file is JSON someone can edit by hand, so never assume the shape.
+        data["history"] = []
+    if not float(data.get("next_draw", 0)):
+        data["next_draw"] = time.time() + LOTTERY_WEEK_SECONDS
+        lottery.save()
+    return data
+
+
+def scratch_ticket(rng: random.Random = random):
+    """Pick a ticket type and scratch it. Returns `(name, prize_coins)`."""
+    weights = [entry[1] for entry in LOTTERY_TYPES]
+    name, _, table = rng.choices(LOTTERY_TYPES, weights=weights, k=1)[0]
+    for chance, prize in table:
+        if rng.random() < chance:
+            return name, prize
+    return name, 0
+
+
+def _lottery_pick_winner(tickets: dict):
+    """Weighted pick from `{uid: count}`. None when nobody is holding one."""
+    pool = [(uid, int(count)) for uid, count in tickets.items() if int(count) > 0]
+    if not pool:
+        return None
+    return random.choices([uid for uid, _ in pool], weights=[count for _, count in pool], k=1)[0]
+
+
+async def _name_of(uid) -> str:
+    try:
+        user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
+        return user.display_name
+    except Exception:
+        return f"user {uid}"
+
+
+async def run_lottery_draw(force: bool = False) -> bool:
+    """Draw the pot if the week is up. Returns True when a draw happened.
+
+    Called both by the sweep and at the top of `>lottery`, so the result is
+    never stale just because the timer has not ticked. A week with no tickets
+    rolls the pot over rather than vanishing it.
+    """
+    data = lottery_state()
+    now = time.time()
+    if not force and now < float(data.get("next_draw", 0)):
+        return False
+
+    pot = int(data.get("pot", 0))
+    tickets = data.get("tickets") or {}
+    winner = _lottery_pick_winner(tickets)
+    stamp = now
+    data["draws"] = int(data.get("draws", 0)) + 1
+    data["next_draw"] = now + LOTTERY_WEEK_SECONDS
+
+    if winner is None:
+        # Nobody entered: keep the pot for next week.
+        data["history"].insert(0, {"uid": None, "name": None, "amount": 0, "at": stamp, "rolled": True})
+    else:
+        rec = acct(winner)
+        rec["balance"] = int(rec.get("balance", 0)) + pot
+        economy.save()
+        name = await _name_of(winner)
+        data["history"].insert(0, {"uid": str(winner), "name": name, "amount": pot, "at": stamp, "rolled": False})
+        data["pot"] = 0
+        try:
+            user = bot.get_user(int(winner)) or await bot.fetch_user(int(winner))
+            await user.send(f"🎉 You won the weekly lottery — **{pot:,}** {CURRENCY} is in your wallet!")
+        except Exception as exc:
+            log(f"Lottery winner DM failed for {winner}: {type(exc).__name__}: {exc}")
+
+    del data["history"][8:]
+    data["tickets"] = {}
+    lottery.save()
+    log(f"Lottery draw #{data['draws']}: {'no entries, pot rolls over' if winner is None else f'{winner} won {pot}'}")
+    return True
+
+
+@bot.command(name="lottery", aliases=["lotto"])
+async def lottery_cmd(ctx: commands.Context, action: str = None, amount: str = None):
+    """`>lottery`, `>lottery buy 3` — scratch tickets plus a weekly pot."""
+    await run_lottery_draw()
+    data = lottery_state()
+    verb = (action or "").strip().lower()
+
+    if verb in ("buy", "b"):
+        if amount is None:
+            return await ctx.send(
+                f"> How many? `{COMMAND_PREFIX}lottery buy 3` — "
+                f"{LOTTERY_TICKET_PRICE:,} {CURRENCY} each, up to {LOTTERY_MAX_TICKETS}."
+            )
+        text = amount.strip().lower()
+        if not text.isdigit() or int(text) < 1:
+            return await ctx.send(f"> Buy between 1 and {LOTTERY_MAX_TICKETS} tickets at a time.")
+        wanted = int(text)
+        if wanted > LOTTERY_MAX_TICKETS:
+            return await ctx.send(
+                f"> You can only buy **{LOTTERY_MAX_TICKETS}** tickets at a time — "
+                f"`{COMMAND_PREFIX}lottery buy {LOTTERY_MAX_TICKETS}`."
+            )
+
+        held = int(data["tickets"].get(str(ctx.author.id), 0))
+        room = LOTTERY_MAX_TICKETS - held
+        if room <= 0:
+            return await ctx.send(
+                f"> You already hold **{held}** tickets — that is the maximum for this draw. "
+                f"Good luck!"
+            )
+        if wanted > room:
+            return await ctx.send(
+                f"> You already hold **{held}** tickets, so you can only buy **{room}** more "
+                f"for this draw."
+            )
+
+        cost = wanted * LOTTERY_TICKET_PRICE
+        rec = acct(ctx.author.id)
+        if int(rec["balance"]) < cost:
+            return await ctx.send(
+                f"> **{wanted}** ticket{'s' if wanted != 1 else ''} costs **{cost:,}** {CURRENCY} "
+                f"and your wallet has **{int(rec['balance']):,}**."
+            )
+
+        rec["balance"] = int(rec["balance"]) - cost
+        data["pot"] = int(data.get("pot", 0)) + int(cost * LOTTERY_POT_SHARE)
+        data["tickets"][str(ctx.author.id)] = held + wanted
+
+        lines = [f"> 🎟️ Bought **{wanted}** ticket{'s' if wanted != 1 else ''} for **{cost:,}** {CURRENCY} — scratching them now…"]
+        won = 0
+        for index in range(1, wanted + 1):
+            kind, prize = scratch_ticket()
+            won += prize
+            if prize:
+                lines.append(f"> `#{index}` **{kind}** — scratched **+{prize:,}** {CURRENCY}!")
+            else:
+                lines.append(f"> `#{index}` **{kind}** — nothing this time.")
+        if won:
+            rec["balance"] = int(rec["balance"]) + won
+            lines.append(f"> Scratch winnings: **{won:,}** {CURRENCY}.")
+        lines.append(
+            f"> You hold **{held + wanted}**/{LOTTERY_MAX_TICKETS} tickets · pot is now "
+            f"**{int(data['pot']):,}** {CURRENCY} · draw {human_delta(float(data['next_draw']) - time.time())}"
+        )
+        economy.save()
+        lottery.save()
+        await try_delete(ctx.message)
+        return await send_clean(ctx, content="\n".join(lines), delete_after=25)
+
+    # No argument (or anything unrecognised): show the state of the draw.
+    held = int(data["tickets"].get(str(ctx.author.id), 0))
+    embed = discord.Embed(title="🎟️ Weekly Lottery", color=discord.Color.gold())
+    embed.add_field(name="Pot", value=f"{int(data.get('pot', 0)):,} {CURRENCY}")
+    embed.add_field(name="Ticket price", value=f"{LOTTERY_TICKET_PRICE:,} {CURRENCY}")
+    embed.add_field(name="Your tickets", value=f"{held}/{LOTTERY_MAX_TICKETS}")
+    embed.add_field(name="Next draw", value=human_delta(max(0, float(data["next_draw"]) - time.time())))
+    entries = sum(int(count) for count in data["tickets"].values())
+    embed.add_field(name="Tickets in play", value=str(entries))
+
+    history = data.get("history") or []
+    if history:
+        last = history[0]
+        if last.get("rolled"):
+            embed.add_field(name="Last draw", value="No entries — the pot rolled over.", inline=False)
+        else:
+            embed.add_field(
+                name="Last draw",
+                value=f"**{last.get('name') or 'someone'}** won **{int(last.get('amount', 0)):,}** {CURRENCY}",
+                inline=False,
+            )
+    embed.set_footer(text=f"Buy with {COMMAND_PREFIX}lottery buy <amount> · max {LOTTERY_MAX_TICKETS} per draw")
+    return await ctx.send(embed=embed)
+
+
+@tasks.loop(minutes=15)
+async def lottery_draw_sweep():
+    """Draw the pot once the week is up, even if nobody runs `>lottery`."""
+    await run_lottery_draw()
+
+
+@lottery_draw_sweep.before_loop
+async def before_lottery_draw_sweep():
+    await bot.wait_until_ready()
+
+
+# ---------------------------------------------------------------------------
+# ROULETTE
+# ---------------------------------------------------------------------------
+
+# European wheel. 0 is green; the rest split red/black in the usual pattern.
+RED_NUMBERS = frozenset({1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36})
+BLACK_NUMBERS = frozenset({2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35})
+
+# What a winning pick pays back, stake included. A colour is even money; a
+# single number is the real 35:1.
+ROULETTE_COLOUR_PAYS = 2
+ROULETTE_NUMBER_PAYS = 36
+
+
+def parse_roulette(raw: str):
+    """Parse a roulette selection into a list of `(kind, value)` picks.
+
+    Accepts a colour (`r`, `red`, `b`, `black`, `g`, `green`), a bare number
+    (`17`, `0`) or a colour with a number glued on (`r25`), which is how the
+    compound bet reads: stake a colour and a number at once. Returns None when
+    the text is not a selection at all.
+    """
+    text = str(raw or "").strip().lower().replace(" ", "")
+    if not text:
+        return None
+
+    picks = []
+    # A leading colour, optionally followed by a number: `r`, `r25`, `b0`.
+    match = re.fullmatch(r"(r|red|b|black|g|green)(\d{1,2})?", text)
+    if match:
+        colour = match.group(1)
+        colour = {"red": "red", "r": "red", "black": "black", "b": "black",
+                  "green": "green", "g": "green"}[colour]
+        picks.append((colour, 1))
+        digits = match.group(2)
+        if digits is not None:
+            number = int(digits)
+            if number > 36:
+                return None
+            picks.append(("number", number))
+        return picks
+
+    if text.isdigit():
+        number = int(text)
+        if number > 36:
+            return None
+        return [("number", number)]
+
+    return None
+
+
+def roulette_colour(number: int) -> str:
+    if number == 0:
+        return "green"
+    return "red" if number in RED_NUMBERS else "black"
+
+
+def roulette_pick_wins(kind: str, value: int, number: int) -> bool:
+    if kind == "number":
+        return number == value
+    if kind == "green":
+        return number == 0
+    return roulette_colour(number) == kind
+
+
+def roulette_emoji(kind: str, value: int) -> str:
+    if kind == "number":
+        return f"number {value}"
+    return kind
+
+
+def roulette_payout(picks, amount: int, number: int):
+    """Split the stake across the picks and settle them against `number`.
+
+    Returns `(total_returned, [(kind, value, stake, payout), ...])`. The stake
+    is divided evenly, with any odd coin going to the first pick, so the
+    amounts always add back up to exactly what was taken.
+    """
+    share, remainder = divmod(amount, len(picks))
+    results = []
+    total = 0
+    for index, (kind, value) in enumerate(picks):
+        stake = share + (remainder if index == 0 else 0)
+        if roulette_pick_wins(kind, value, number):
+            multiplier = ROULETTE_NUMBER_PAYS if kind in ("number", "green") else ROULETTE_COLOUR_PAYS
+            payout = stake * multiplier
+        else:
+            payout = 0
+        total += payout
+        results.append((kind, value, stake, payout))
+    return total, results
+
+
+@bot.command(name="roulette")
+async def roulette(ctx: commands.Context, amount: str = None, selection: str = None):
+    """`>roulette 100 r`, `>roulette 100 17`, `>roulette 100 r25`."""
+    if amount is None or selection is None:
+        return await ctx.send(
+            f"> Usage: `{COMMAND_PREFIX}roulette <amount> <bet>` — for example "
+            f"`{COMMAND_PREFIX}roulette 100 r` (red), `{COMMAND_PREFIX}roulette 100 17` "
+            f"(single number) or `{COMMAND_PREFIX}roulette 100 r25` (red *and* 25)."
+        )
+
+    rec = acct(ctx.author.id)
+    bet = parse_bet(amount, rec)
+    if bet is None:
+        return await ctx.send("> That bet doesn't work. Try `10`, `half` or `all`.")
+
+    picks = parse_roulette(selection)
+    if picks is None:
+        return await ctx.send(
+            f"> I don't know that bet. Use `r`/`red`, `b`/`black`, `g`/`green`, a number "
+            f"`0`-`36`, or a mix like `r25`."
+        )
+
+    number = random.randint(0, 36)
+    colour = roulette_colour(number)
+    total, results = roulette_payout(picks, bet, number)
+
+    rec["balance"] = int(rec["balance"]) - bet + total
+    if total > bet:
+        rec["wins"] = int(rec.get("wins", 0)) + 1
+    elif total == 0:
+        rec["losses"] = int(rec.get("losses", 0)) + 1
+    economy.save()
+
+    lines = [f"> 🎡 The wheel lands on **{number} {colour}**."]
+    for kind, value, stake, payout in results:
+        label = roulette_emoji(kind, value)
+        if payout:
+            lines.append(f"> {label} — **{stake:,}** {CURRENCY} pays **{payout:,}** {CURRENCY}.")
+        else:
+            lines.append(f"> {label} — **{stake:,}** {CURRENCY} lost.")
+    net = total - bet
+    if net > 0:
+        lines.append(f"> Net **+{net:,}** {CURRENCY} · wallet {int(rec['balance']):,}")
+    elif net == 0:
+        lines.append(f"> Push — your **{bet:,}** {CURRENCY} comes back · wallet {int(rec['balance']):,}")
+    else:
+        lines.append(f"> Net **{net:,}** {CURRENCY} · wallet {int(rec['balance']):,}")
+
+    await try_delete(ctx.message)
+    await send_clean(ctx, content="\n".join(lines), delete_after=20)
+
+
+
 @bot.command(name="rob")
 async def rob(ctx: commands.Context, member: discord.Member):
     if member.bot or member.id == ctx.author.id:
@@ -2702,19 +3279,31 @@ async def shop(ctx: commands.Context, action: str = None, item: str = None):
     await ctx.send(embed=embed)
 
 
-@bot.command(name="gift")
-async def gift(ctx: commands.Context, member: discord.Member, amount: int):
+@bot.command(name="pay")
+async def pay(ctx: commands.Context, member: discord.Member, amount: int = None):
+    """Send coins from your wallet to someone else. Replaces the old `>gift`."""
     if member.bot or member.id == ctx.author.id:
         return await ctx.send("> Pick a real person who isn't you.")
+    rec = acct(ctx.author.id)
+    if amount is None:
+        return await ctx.send(f"> How much? `{COMMAND_PREFIX}pay @user 100`.")
     if amount < 1:
         return await ctx.send("> Send at least 1 coin.")
-    rec = acct(ctx.author.id)
     if rec["balance"] < amount:
-        return await ctx.send("> You don't have that much in your wallet.")
+        return await ctx.send(
+            f"> You only have **{rec['balance']:,}** {CURRENCY} in your wallet. "
+            f"Use `{COMMAND_PREFIX}withdraw` if it is sitting in the bank."
+        )
     rec["balance"] -= amount
     add_coins(member.id, amount)
     economy.save()
-    await ctx.send(f"> Sent **{amount}** {CURRENCY} to {member.display_name}.")
+    await try_delete(ctx.message)
+    await send_clean(
+        ctx,
+        content=(f"> Paid **{amount:,}** {CURRENCY} to {member.display_name}. "
+                 f"Wallet {rec['balance']:,} · Bank {rec['bank']:,}"),
+        delete_after=15,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2987,69 +3576,8 @@ async def urban(ctx: commands.Context, *, term: str):
 # ---------------------------------------------------------------------------
 
 
-def _timestamp_of(message: discord.Message) -> str:
-    try:
-        return discord.utils.format_dt(message.created_at, "f")
-    except Exception:
-        return ""
 
 
-def _top_role_colour(member):
-    """The quoted author's top role colour, blurple when it is the default."""
-    try:
-        if isinstance(member, discord.Member):
-            role = getattr(member, "top_role", None)
-            if role is not None and role.color.value:
-                return (role.color.r, role.color.g, role.color.b)
-        elif getattr(member, "color", None) is not None and member.color.value:
-            return (member.color.r, member.color.g, member.color.b)
-    except Exception:
-        pass
-    return QUOTE_ACCENT
-
-
-@bot.command(name="quote", aliases=["q"])
-async def quote(ctx: commands.Context):
-    """Turn the message you replied to into a PNG card."""
-    reference = ctx.message.reference
-    if reference is None:
-        return await ctx.send(f"> Reply to the message you want to quote, then run `{COMMAND_PREFIX}quote`.")
-
-    target = reference.resolved
-    if target is None:
-        try:
-            target = await ctx.channel.fetch_message(reference.message_id)
-        except Exception:
-            return await ctx.send("> I could not fetch that message — it may be too old or in a channel I cannot read.")
-
-    if not isinstance(target, discord.Message):
-        return await ctx.send("> I could not fetch that message — it may be too old or in a channel I cannot read.")
-
-    author = target.author
-    name = getattr(author, "display_name", None) or getattr(author, "name", "Unknown")
-    body = (target.content or "").strip()
-    if not body:
-        body = target.system_content or "[no text in that message]"
-    stamp = _timestamp_of(target)
-
-    await try_delete(ctx.message)
-
-    try:
-        avatar_bytes = await author.display_avatar.read()
-        bot_icon = None
-        if bot.user:
-            try:
-                bot_icon = await bot.user.display_avatar.read()
-            except Exception:
-                bot_icon = None
-        png = await asyncio.to_thread(
-            render_quote_card, body, name, stamp, _top_role_colour(author), avatar_bytes,
-            bot.user.name if bot.user else "wispcord", bot_icon,
-        )
-        await ctx.send(file=discord.File(io.BytesIO(png), filename="quote.png"))
-    except Exception as exc:
-        log(f"Quote card render failed: {type(exc).__name__}: {exc}")
-        await ctx.send(f"**{name}** said:\n>>> {body[:QUOTE_MAX_CHARS]}")
 
 
 # ---------------------------------------------------------------------------
@@ -3167,27 +3695,36 @@ async def work_sweep():
         if kind == "quick" and now - started >= QWORK_SECONDS:
             payout = int(entry.get("payout", 0))
             rec = acct(key)
-            rec["balance"] = int(rec.get("balance", 0)) + payout
+            paid, net = apply_loan_payment(key, payout)
+            rec["balance"] = int(rec.get("balance", 0)) + net
             economy.save()
             worker.data.pop(key, None)
             changed = True
             try:
                 user = bot.get_user(int(key)) or await bot.fetch_user(int(key))
-                await user.send(f"Your {job_title(key)} paid out: **{payout}** {CURRENCY}.")
+                note = _loan_line(paid, loan_balance(rec))
+                await user.send(
+                    f"Your {job_title(key)} paid out: **{net}** {CURRENCY}."
+                    + (f"\n{note}" if note else "")
+                )
             except Exception as exc:
                 log(f"Quick work DM failed for {key}: {type(exc).__name__}: {exc}")
 
         elif kind == "passive" and now - started >= WORK_CAP_SECONDS:
             lines = await _finish_passive(key, announce=False)
             changed = True
-            coins = 0
+            net = 0
             minutes = 0
+            paid = 0
             if lines:
-                payload = worker_cap_summary(key)
-                coins, minutes = payload
+                net, minutes, paid = worker_cap_summary(key)
             try:
                 user = bot.get_user(int(key)) or await bot.fetch_user(int(key))
-                await user.send(f"Clocked out after 8 hours. Total: {coins} coins for {minutes} minutes.")
+                note = _loan_line(paid, loan_balance(acct(key)))
+                await user.send(
+                    f"Clocked out after 8 hours. Total: {net} coins for {minutes} minutes."
+                    + (f"\n{note}" if note else "")
+                )
             except Exception as exc:
                 log(f"Clock-out DM failed for {key}: {type(exc).__name__}: {exc}")
 
@@ -3196,12 +3733,13 @@ async def work_sweep():
 
 
 def worker_cap_summary(key: str):
-    """(coins, minutes) for the passive job that just capped out.
+    """(coins, minutes, loan_paid) for the passive job that just capped out.
 
     Read after `_finish_passive`, which stashes the last payment here so the
-    clock-out DM can quote the exact numbers that were paid.
+    clock-out DM can quote the exact numbers that were paid — including the
+    slice that went to a loan, which is why the gross/net split is carried.
     """
-    return LAST_PASSIVE_PAYOUT.get(key, (0, 0))
+    return LAST_PASSIVE_PAYOUT.get(key, (0, 0, 0))
 
 
 @work_sweep.before_loop
@@ -3504,6 +4042,7 @@ async def setup_hook():
     sweep_game_state.start()
     work_sweep.start()
     reminder_sweep.start()
+    lottery_draw_sweep.start()
 
     if SUPABASE_URL and SUPABASE_SERVICE_KEY:
         heartbeat.start()
